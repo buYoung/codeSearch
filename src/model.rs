@@ -9,6 +9,12 @@ pub struct SearchRequest {
     pub limit: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchMode {
+    Direct,
+    Explore,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SearchTarget {
@@ -19,7 +25,9 @@ pub struct SearchTarget {
     pub enclosing_symbol_name: Option<String>,
     pub line_start: usize,
     pub line_end: usize,
-    pub searchable_text: String,
+    pub symbol_name_search_text: String,
+    pub signature_search_text: String,
+    pub context_search_text: String,
     pub display_snippet: String,
     pub declaration_snippet: String,
     pub signature_text: Option<String>,
@@ -156,6 +164,17 @@ impl Display for SearchTargetKind {
             Self::Method => "method",
             Self::Type => "type",
             Self::File => "file",
+        };
+
+        formatter.write_str(label)
+    }
+}
+
+impl Display for SearchMode {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Direct => "direct",
+            Self::Explore => "explore",
         };
 
         formatter.write_str(label)

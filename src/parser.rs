@@ -154,18 +154,14 @@ fn build_primary_target(
             .collect::<Vec<_>>(),
     );
 
-    let mut searchable_parts = vec![
-        symbol_name.clone(),
-        signature_text.clone(),
-        comment_text.clone(),
-        token_text,
-    ];
-    searchable_parts.extend(
+    let mut signature_search_parts = vec![signature_text.clone()];
+    signature_search_parts.extend(
         parameter_descriptions
             .iter()
             .map(|description| description.text.clone()),
     );
-    searchable_parts.extend(call_names.iter().cloned());
+    let mut context_search_parts = vec![comment_text.clone(), token_text];
+    context_search_parts.extend(call_names.iter().cloned());
 
     let doc_comment = if comment_text.is_empty() {
         None
@@ -178,6 +174,9 @@ fn build_primary_target(
     } else {
         None
     };
+    let symbol_name_search_text = build_search_text(&[symbol_name.clone()]);
+    let signature_search_text = build_search_text(&signature_search_parts);
+    let context_search_text = build_search_text(&context_search_parts);
 
     Some(SearchTarget {
         file_path: context.relative_file_path.to_path_buf(),
@@ -187,7 +186,9 @@ fn build_primary_target(
         enclosing_symbol_name: None,
         line_start: node.start_position().row + 1,
         line_end: node.end_position().row + 1,
-        searchable_text: build_searchable_text(&searchable_parts),
+        symbol_name_search_text,
+        signature_search_text,
+        context_search_text,
         display_snippet,
         declaration_snippet,
         signature_text: if signature_text.is_empty() {
@@ -288,28 +289,36 @@ fn build_local_binding_target(
         context,
     );
 
-    let mut searchable_parts = vec![
-        symbol_name.clone(),
+    let mut context_search_parts = vec![
         declaration_text.clone(),
         initializer_text.clone(),
         callable_target.symbol_name.clone(),
     ];
     if let Some(type_hint) = explicit_type_hint.clone() {
-        searchable_parts.push(type_hint);
+        context_search_parts.push(type_hint);
     }
-    searchable_parts.extend(flow_steps.iter().map(|step| step.label.clone()));
-    searchable_parts.extend(
+    context_search_parts.extend(flow_steps.iter().map(|step| step.label.clone()));
+    context_search_parts.extend(
         incoming_dependencies
             .iter()
             .map(|dependency| dependency.label.clone()),
     );
-    searchable_parts.extend(
+    context_search_parts.extend(
         outgoing_dependencies
             .iter()
             .map(|dependency| dependency.label.clone()),
     );
-    searchable_parts.push(tokenize_text(&declaration_text).join(" "));
-    searchable_parts.push(tokenize_text(&initializer_text).join(" "));
+    context_search_parts.push(tokenize_text(&declaration_text).join(" "));
+    context_search_parts.push(tokenize_text(&initializer_text).join(" "));
+
+    let symbol_name_search_text = build_search_text(&[symbol_name.clone()]);
+    let signature_search_text = build_search_text(
+        &explicit_type_hint
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+    let context_search_text = build_search_text(&context_search_parts);
 
     Some(SearchTarget {
         file_path: context.relative_file_path.to_path_buf(),
@@ -319,7 +328,9 @@ fn build_local_binding_target(
         enclosing_symbol_name: Some(callable_target.symbol_name.clone()),
         line_start: descriptor.display_node.start_position().row + 1,
         line_end: descriptor.display_node.end_position().row + 1,
-        searchable_text: build_searchable_text(&searchable_parts),
+        symbol_name_search_text,
+        signature_search_text,
+        context_search_text,
         display_snippet: build_display_snippet("", &declaration_text),
         declaration_snippet,
         signature_text: None,
@@ -926,6 +937,8 @@ fn build_fallback_target(context: &SourceContext<'_>) -> SearchTarget {
         .unwrap_or("file")
         .to_string();
 
+    let symbol_name_search_text = build_search_text(&[file_name.clone()]);
+
     SearchTarget {
         file_path: context.relative_file_path.to_path_buf(),
         language: context.language,
@@ -934,7 +947,9 @@ fn build_fallback_target(context: &SourceContext<'_>) -> SearchTarget {
         enclosing_symbol_name: None,
         line_start: 1,
         line_end,
-        searchable_text: tokenize_text(context.source).join(" "),
+        symbol_name_search_text,
+        signature_search_text: String::new(),
+        context_search_text: tokenize_text(context.source).join(" "),
         display_snippet: truncate_text(&snippet, 400),
         declaration_snippet: truncate_text(&build_single_line_snippet(context.source), 200),
         signature_text: None,
@@ -1309,7 +1324,7 @@ fn normalize_type_text(text: &str) -> String {
     condense_whitespace(text).trim_start_matches(':').trim().to_string()
 }
 
-fn build_searchable_text(parts: &[String]) -> String {
+fn build_search_text(parts: &[String]) -> String {
     parts
         .iter()
         .map(|part| condense_whitespace(part))

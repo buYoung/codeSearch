@@ -45,11 +45,12 @@
 ## 예상 CLI 표면
 
 ```text
-code-search search <directoryPath> <query> --limit 10
+code-search search <directoryPath> <query> --limit 10 --mode direct
 ```
 
 - `query`는 여러 단어를 받을 수 있다
 - `limit`는 파일 결과 개수에만 적용한다
+- `mode`는 `direct`와 `explore` 중 하나이며 기본값은 `direct`다
 
 ## 아키텍처 개요
 
@@ -79,9 +80,10 @@ code-search search <directoryPath> <query> --limit 10
 5. function, method, type, local binding target을 추출한다
 6. 각 target에서 선언, comment, identifier token, dependency, same-scope flow 정보를 검색용 텍스트로 만든다
 7. in-memory `tantivy` 인덱스에 target 문서를 추가한다
-8. `tantivy`의 `BM25` ranking으로 target을 스코어링한다
-9. score 상위 target을 hit 중심 trace 결과로 조립한다
-10. local binding hit는 `선언 / 데이터 흐름 / 의존성`, callable hit는 `구현 / 상위 호출지점 / 의존성`으로 보여준다
+8. `tantivy`의 multi-field `BM25` ranking으로 target을 스코어링한다
+9. `direct` 모드에서는 exact symbol hit를 먼저, `explore` 모드에서는 score 중심으로 결과를 정렬한다
+10. score 상위 target을 hit 중심 trace 결과로 조립한다
+11. local binding hit는 `선언 / 데이터 흐름 / 의존성`, callable hit는 `구현 / 상위 호출지점 / 의존성`으로 보여준다
 
 ## 개념 인터페이스
 

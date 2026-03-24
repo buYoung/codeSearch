@@ -9,14 +9,18 @@ use crate::text::tokenize_text;
 pub(crate) struct TantivySearchIndex {
     index: Index,
     chunk_index_field: Field,
-    searchable_text_field: Field,
+    symbol_name_field: Field,
+    signature_field: Field,
+    context_field: Field,
 }
 
 impl TantivySearchIndex {
     pub(crate) fn build(search_targets: &[SearchTarget]) -> Result<Self, SearchError> {
         let mut schema_builder = Schema::builder();
         let chunk_index_field = schema_builder.add_u64_field("chunk_index", STORED);
-        let searchable_text_field = schema_builder.add_text_field("searchable_text", TEXT);
+        let symbol_name_field = schema_builder.add_text_field("symbol_name", TEXT);
+        let signature_field = schema_builder.add_text_field("signature_text", TEXT);
+        let context_field = schema_builder.add_text_field("context_text", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer(50_000_000)?;
@@ -24,7 +28,9 @@ impl TantivySearchIndex {
         for (chunk_index, search_target) in search_targets.iter().enumerate() {
             index_writer.add_document(doc!(
                 chunk_index_field => chunk_index as u64,
-                searchable_text_field => search_target.searchable_text.clone(),
+                symbol_name_field => search_target.symbol_name_search_text.clone(),
+                signature_field => search_target.signature_search_text.clone(),
+                context_field => search_target.context_search_text.clone(),
             ))?;
         }
 
@@ -33,7 +39,9 @@ impl TantivySearchIndex {
         Ok(Self {
             index,
             chunk_index_field,
-            searchable_text_field,
+            symbol_name_field,
+            signature_field,
+            context_field,
         })
     }
 
@@ -45,7 +53,13 @@ impl TantivySearchIndex {
 
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
-        let query_parser = QueryParser::for_index(&self.index, vec![self.searchable_text_field]);
+        let mut query_parser = QueryParser::for_index(
+            &self.index,
+            vec![self.symbol_name_field, self.signature_field, self.context_field],
+        );
+        query_parser.set_field_boost(self.symbol_name_field, 6.0);
+        query_parser.set_field_boost(self.signature_field, 3.0);
+        query_parser.set_field_boost(self.context_field, 1.0);
         let parsed_query = query_parser.parse_query(&normalized_query)?;
         let top_documents = searcher.search(&parsed_query, &TopDocs::with_limit(result_limit.max(1)))?;
         let mut scored_chunks = Vec::new();

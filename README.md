@@ -6,7 +6,7 @@
 
 ## 현재 상태
 
-- `search` 명령만 지원합니다
+- `search` 명령을 지원하고 `--mode direct|explore`로 탐색 의도를 조절할 수 있습니다
 - 지원 확장자: `.rs`, `.go`, `.ts`, `.tsx`
 - 디렉터리 스캔 시 `.gitignore`와 기본 ignore 규칙을 존중합니다
 - 결과는 hit 중심 trace 형식으로 출력되고, 선언/데이터 흐름/의존성 또는 구현/상위 호출지점을 함께 보여줍니다
@@ -22,23 +22,24 @@
 개발 실행:
 
 ```text
-cargo run -- search <directoryPath> <query> --limit 10
+cargo run -- search <directoryPath> <query> --limit 10 --mode direct
 ```
 
 빌드 후 실행:
 
 ```text
 cargo build
-./target/debug/code-search search <directoryPath> <query> --limit 10
+./target/debug/code-search search <directoryPath> <query> --limit 10 --mode direct
 ```
 
 도움말에 해당하는 usage:
 
 ```text
-code-search search <directoryPath> <query> [--limit <number>]
+code-search search <directoryPath> <query> [--limit <number>] [--mode <direct|explore>]
 ```
 
 - 공백이 들어가는 query는 `"http client retry"`처럼 따옴표로 감싸는 편이 안전합니다
+- `--mode` 기본값은 `direct`입니다
 
 ## 예시 명령어
 
@@ -52,6 +53,12 @@ cargo run -- search . search --limit 3
 
 ```text
 cargo run -- search . CodeSearchService --limit 5
+```
+
+관련 맥락까지 넓게 탐색:
+
+```text
+cargo run -- search ./src analyze_file --limit 5 --mode explore
 ```
 
 `src` 디렉터리만 대상으로 `parse` 관련 코드 찾기:
@@ -73,8 +80,12 @@ Scanned files: 1
 Matched targets: 4
 Warnings: 0
 
-결과 1  score=8.550
 질문: 'clinicalReviewQuery'
+Mode: direct
+
+━━━ Direct matches ━━━
+
+결과 1  local  clinicalReviewQuery  rpm99091.service.ts:5  [exact]  score=8.550
 
 ━━━ 선언 ━━━
   const clinicalReviewQuery = this.rpm99091Repository.findRPM99091ClinicalReview(query);
@@ -89,10 +100,12 @@ Warnings: 0
 - `Scanned files`: 검색 대상으로 본 지원 파일 수
 - `Matched targets`: 검색어와 매칭된 target 수
 - `Warnings`: parse 실패 등으로 fallback 처리한 횟수
+- `Direct matches`: exact symbol lookup에 가까운 결과
+- `Related matches`: exact match 주변의 관련 구현/흐름 결과
 
 ## 구현 요약
 
 - `tree-sitter`로 function, method, type, local binding target을 추출합니다
 - 파일별 parsing/target 추출은 `rayon`으로 병렬 처리합니다
-- 각 target에서 선언, direct dependency, same-scope data flow, callable dependency를 검색용 텍스트로 만듭니다
-- in-memory `tantivy` 인덱스에 target을 넣고 `BM25`로 점수화한 뒤 trace 결과로 렌더링합니다
+- 각 target에서 `symbol`, `signature`, `context` 검색 field를 만듭니다
+- in-memory `tantivy` 인덱스에서 field별 boost를 적용해 `BM25`로 점수화하고, `direct` 모드에서는 exact symbol 결과를 먼저 배치합니다

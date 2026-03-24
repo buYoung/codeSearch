@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -5,8 +6,8 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 
 use crate::model::{
-    SearchError, SearchRequest, SearchResults, SearchTarget, SearchTargetKind, SearchTraceResult,
-    SupportedLanguage, TraceEntry, TraceRelationship, TraceSection,
+    SearchError, SearchMode, SearchRequest, SearchResults, SearchTarget, SearchTargetKind,
+    SearchTraceResult, SupportedLanguage, TraceEntry, TraceRelationship, TraceSection,
 };
 use crate::parser::analyze_file;
 use crate::tantivy_search::TantivySearchIndex;
@@ -14,19 +15,36 @@ use crate::text::tokenize_text;
 
 pub struct CodeSearchService;
 
+#[derive(Clone, Debug)]
+struct ScoredSearchTarget {
+    target_index: usize,
+    score: f64,
+    is_exact_symbol_match: bool,
+    is_direct_match: bool,
+}
+
 impl CodeSearchService {
     pub fn new() -> Self {
         Self
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchResults, SearchError> {
+        self.search_with_mode(request, SearchMode::Direct)
+    }
+
+    pub fn search_with_mode(
+        &self,
+        request: SearchRequest,
+        search_mode: SearchMode,
+    ) -> Result<SearchResults, SearchError> {
         if request.limit == 0 {
             return Err(SearchError::InvalidRequest(
                 "limit must be greater than 0".to_string(),
             ));
         }
 
-        if tokenize_text(&request.query).is_empty() {
+        let normalized_query = normalize_query(&request.query);
+        if normalized_query.is_empty() {
             return Err(SearchError::InvalidRequest(
                 "query must include at least one searchable token".to_string(),
             ));
@@ -77,34 +95,50 @@ impl CodeSearchService {
             .score_chunks(&request.query, search_targets.len())?
             .into_iter()
             .map(|(target_index, base_score)| {
-                (
+                let search_target = &search_targets[target_index];
+                let is_exact_symbol_match = is_exact_symbol_match(&normalized_query, search_target);
+
+                ScoredSearchTarget {
                     target_index,
-                    adjust_score(base_score, &request.query, &search_targets[target_index]),
-                )
+                    score: adjust_score(base_score, &normalized_query, search_target),
+                    is_exact_symbol_match,
+                    is_direct_match: false,
+                }
             })
             .collect::<Vec<_>>();
 
-        scored_targets.sort_by(|left, right| {
-            right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    search_targets[left.0]
-                        .file_path
-                        .cmp(&search_targets[right.0].file_path)
-                })
-                .then_with(|| search_targets[left.0].line_start.cmp(&search_targets[right.0].line_start))
+        let exact_primary_match_exists = scored_targets.iter().any(|scored_target| {
+            scored_target.is_exact_symbol_match
+                && is_primary_direct_kind(search_targets[scored_target.target_index].target_kind)
         });
+
+        if search_mode == SearchMode::Direct {
+            for scored_target in &mut scored_targets {
+                let target_kind = search_targets[scored_target.target_index].target_kind;
+                scored_target.is_direct_match = match target_kind {
+                    SearchTargetKind::Function
+                    | SearchTargetKind::Method
+                    | SearchTargetKind::Type => scored_target.is_exact_symbol_match,
+                    SearchTargetKind::LocalBinding => {
+                        !exact_primary_match_exists && scored_target.is_exact_symbol_match
+                    }
+                    SearchTargetKind::File => false,
+                };
+            }
+
+            scored_targets.sort_by(|left, right| compare_direct_mode(left, right, &search_targets));
+        } else {
+            scored_targets.sort_by(|left, right| compare_explore_mode(left, right, &search_targets));
+        }
 
         let matched_target_count = scored_targets.len();
         let results = scored_targets
             .into_iter()
             .take(request.limit)
-            .map(|(target_index, score)| {
+            .map(|scored_target| {
                 build_trace_result(
-                    target_index,
-                    score,
+                    scored_target.target_index,
+                    scored_target.score,
                     &search_targets,
                     &callable_indices_by_name,
                     &caller_index,
@@ -615,19 +649,18 @@ fn select_primary_caller(
 
 fn adjust_score(
     base_score: f64,
-    query: &str,
+    normalized_query: &str,
     search_target: &SearchTarget,
 ) -> f64 {
-    let normalized_query = tokenize_text(query).join(" ");
     let normalized_symbol_name = tokenize_text(&search_target.symbol_name).join(" ");
     let mut adjusted_score = base_score;
 
     if normalized_query == normalized_symbol_name {
         adjusted_score += match search_target.target_kind {
-            SearchTargetKind::LocalBinding => 8.0,
-            SearchTargetKind::Function | SearchTargetKind::Method => 6.0,
-            SearchTargetKind::Type => 5.0,
-            SearchTargetKind::File => 2.0,
+            SearchTargetKind::Function | SearchTargetKind::Method => 0.6,
+            SearchTargetKind::Type => 0.5,
+            SearchTargetKind::LocalBinding => 0.4,
+            SearchTargetKind::File => 0.1,
         };
     }
 
@@ -637,10 +670,104 @@ fn adjust_score(
         .map(|name| tokenize_text(name).join(" "))
         .is_some_and(|enclosing_name| enclosing_name == normalized_query)
     {
-        adjusted_score += 1.0;
+        adjusted_score += 0.1;
     }
 
     adjusted_score
+}
+
+fn normalize_query(query: &str) -> String {
+    tokenize_text(query).join(" ")
+}
+
+fn is_exact_symbol_match(normalized_query: &str, search_target: &SearchTarget) -> bool {
+    tokenize_text(&search_target.symbol_name).join(" ") == normalized_query
+}
+
+fn is_primary_direct_kind(target_kind: SearchTargetKind) -> bool {
+    matches!(
+        target_kind,
+        SearchTargetKind::Function | SearchTargetKind::Method | SearchTargetKind::Type
+    )
+}
+
+fn compare_direct_mode(
+    left: &ScoredSearchTarget,
+    right: &ScoredSearchTarget,
+    search_targets: &[SearchTarget],
+) -> Ordering {
+    right
+        .is_direct_match
+        .cmp(&left.is_direct_match)
+        .then_with(|| {
+            let left_kind_priority = if left.is_direct_match {
+                direct_kind_priority(search_targets[left.target_index].target_kind)
+            } else {
+                related_kind_priority(search_targets[left.target_index].target_kind)
+            };
+            let right_kind_priority = if right.is_direct_match {
+                direct_kind_priority(search_targets[right.target_index].target_kind)
+            } else {
+                related_kind_priority(search_targets[right.target_index].target_kind)
+            };
+
+            left_kind_priority.cmp(&right_kind_priority)
+        })
+        .then_with(|| right.score.partial_cmp(&left.score).unwrap_or(Ordering::Equal))
+        .then_with(|| {
+            search_targets[left.target_index]
+                .file_path
+                .cmp(&search_targets[right.target_index].file_path)
+        })
+        .then_with(|| {
+            search_targets[left.target_index]
+                .line_start
+                .cmp(&search_targets[right.target_index].line_start)
+        })
+}
+
+fn compare_explore_mode(
+    left: &ScoredSearchTarget,
+    right: &ScoredSearchTarget,
+    search_targets: &[SearchTarget],
+) -> Ordering {
+    right
+        .score
+        .partial_cmp(&left.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| {
+            related_kind_priority(search_targets[left.target_index].target_kind).cmp(
+                &related_kind_priority(search_targets[right.target_index].target_kind),
+            )
+        })
+        .then_with(|| {
+            search_targets[left.target_index]
+                .file_path
+                .cmp(&search_targets[right.target_index].file_path)
+        })
+        .then_with(|| {
+            search_targets[left.target_index]
+                .line_start
+                .cmp(&search_targets[right.target_index].line_start)
+        })
+}
+
+fn direct_kind_priority(target_kind: SearchTargetKind) -> usize {
+    match target_kind {
+        SearchTargetKind::Function | SearchTargetKind::Method => 0,
+        SearchTargetKind::Type => 1,
+        SearchTargetKind::LocalBinding => 2,
+        SearchTargetKind::File => 3,
+    }
+}
+
+fn related_kind_priority(target_kind: SearchTargetKind) -> usize {
+    match target_kind {
+        SearchTargetKind::Function | SearchTargetKind::Method => 0,
+        SearchTargetKind::Type => 1,
+        SearchTargetKind::LocalBinding => 2,
+        SearchTargetKind::File => 3,
+    }
 }
 
 fn collect_supported_files(directory_path: &Path) -> Result<Vec<PathBuf>, SearchError> {
