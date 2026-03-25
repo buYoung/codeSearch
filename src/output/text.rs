@@ -14,7 +14,7 @@ pub fn render_text(query: &str, search_mode: SearchMode, search_results: &Search
         return output_lines.join("\n");
     }
 
-    output_lines.push(format!("질문: '{}'", query));
+    output_lines.push(format!("Query: '{query}'"));
     output_lines.push(format!("Mode: {}", search_mode));
     output_lines.push(String::new());
 
@@ -107,7 +107,7 @@ fn append_result_header(
     let match_label =
         classify_match_label(query, search_mode, search_result, explicit_match_label);
     let mut header = format!(
-        "결과 {}  {}  {}  {}:{}  [{}]  score={:.3}",
+        "Result {}  {}  {}  {}:{}  [{}]  score={:.3}",
         result_index,
         search_result.target_kind,
         search_result.symbol_name,
@@ -214,7 +214,7 @@ fn append_trace_entry(output_lines: &mut Vec<String>, entry: &TraceEntry) {
     }
 
     if let Some(location) = &entry.location {
-        output_lines.push(format!("    → 위치: {}", format_location(location)));
+        output_lines.push(format!("    -> Location: {}", format_location(location)));
     }
 
     for annotation in &entry.annotations {
@@ -237,5 +237,71 @@ fn format_location(location: &TraceLocation) -> String {
     match &location.context_symbol_name {
         Some(context_symbol_name) => format!("{context_symbol_name}() @ {line_text}"),
         None => line_text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::model::{
+        SearchHit, SearchMode, SearchRawTarget, SearchResults, SearchTargetKind, SectionCategory,
+        SupportedLanguage, TraceEntry, TraceLocation, TraceSection,
+    };
+
+    use super::render_text;
+
+    #[test]
+    fn render_text_uses_english_labels() {
+        let rendered_text = render_text("log", SearchMode::Direct, &build_search_results());
+
+        assert!(rendered_text.contains("Query: 'log'"));
+        assert!(rendered_text.contains("Result 1"));
+        assert!(rendered_text.contains("-> Location: src/example.rs:10"));
+        assert!(!contains_hangul(&rendered_text));
+    }
+
+    fn build_search_results() -> SearchResults {
+        SearchResults {
+            results: vec![SearchHit {
+                score: 12.5,
+                target_id: "src/example.rs#L10-L10:function:log".to_string(),
+                target_kind: SearchTargetKind::Function,
+                symbol_name: "log".to_string(),
+                file_path: PathBuf::from("src/example.rs"),
+                language: SupportedLanguage::Rust,
+                line_start: 10,
+                line_end: 10,
+                sections: vec![TraceSection {
+                    category: SectionCategory::Implementation,
+                    entries: vec![TraceEntry {
+                        relation: None,
+                        text: "fn log()".to_string(),
+                        location: Some(TraceLocation::new(PathBuf::from("src/example.rs"), 10, 10)),
+                        annotations: vec!["-> Return type: ()".to_string()],
+                    }],
+                }],
+                semantic_role: None,
+                raw_target: SearchRawTarget {
+                    signature_text: Some("fn log()".to_string()),
+                    return_type_hint: Some("()".to_string()),
+                    parameter_descriptions: Vec::new(),
+                    incoming_dependencies: Vec::new(),
+                    outgoing_dependencies: Vec::new(),
+                    flow_steps: Vec::new(),
+                    container_name: None,
+                    parent_symbol_name: None,
+                    import_hint: None,
+                },
+            }],
+            scanned_file_count: 1,
+            matched_target_count: 1,
+            warning_count: 0,
+        }
+    }
+
+    fn contains_hangul(text: &str) -> bool {
+        text.chars()
+            .any(|character| ('\u{AC00}'..='\u{D7A3}').contains(&character))
     }
 }

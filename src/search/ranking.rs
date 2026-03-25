@@ -4,8 +4,8 @@ use std::path::Path;
 
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STORED, TEXT};
-use tantivy::{doc, Index, TantivyDocument};
+use tantivy::schema::{Field, Schema, FAST, STORED, TEXT};
+use tantivy::{doc, Index};
 
 use crate::model::{SearchError, SearchMode, SearchTarget, SearchTargetKind};
 use crate::text::tokenize_text;
@@ -34,7 +34,7 @@ pub(crate) fn rank_search_targets(
     let caller_index = build_caller_index(search_targets, &callable_indices_by_name);
     let search_index = TantivySearchIndex::build(search_targets)?;
     let mut scored_targets = search_index
-        .score_chunks(query, search_targets.len())?
+        .score_chunks(&normalized_query, search_targets.len())?
         .into_iter()
         .map(|(target_index, base_score)| {
             let search_target = &search_targets[target_index];
@@ -91,16 +91,19 @@ pub(crate) fn resolve_callable_index(
         return candidates.first().copied();
     }
 
-    let same_file_candidates = candidates
-        .iter()
-        .copied()
-        .filter(|candidate_index| search_targets[*candidate_index].file_path == reference_file_path)
-        .collect::<Vec<_>>();
-    if same_file_candidates.len() == 1 {
-        return same_file_candidates.first().copied();
+    let mut same_file_candidate_index = None;
+
+    for candidate_index in candidates.iter().copied() {
+        if search_targets[candidate_index].file_path != reference_file_path {
+            continue;
+        }
+
+        if same_file_candidate_index.replace(candidate_index).is_some() {
+            return None;
+        }
     }
 
-    None
+    same_file_candidate_index
 }
 
 fn build_callable_indices_by_name(search_targets: &[SearchTarget]) -> HashMap<String, Vec<usize>> {
@@ -164,11 +167,14 @@ fn build_caller_index(
     caller_index
 }
 
-fn adjust_score(base_score: f64, normalized_query: &str, search_target: &SearchTarget) -> f64 {
-    let normalized_symbol_name = tokenize_text(&search_target.symbol_name).join(" ");
+fn adjust_score(
+    base_score: f64,
+    normalized_query: &str,
+    search_target: &SearchTarget,
+) -> f64 {
     let mut adjusted_score = base_score;
 
-    if normalized_query == normalized_symbol_name {
+    if normalized_query == search_target.symbol_name_search_text {
         adjusted_score += match search_target.target_kind {
             SearchTargetKind::Function | SearchTargetKind::Method => 0.6,
             SearchTargetKind::Type => 0.5,
@@ -180,8 +186,8 @@ fn adjust_score(base_score: f64, normalized_query: &str, search_target: &SearchT
     if search_target
         .parent_symbol_name
         .as_ref()
-        .map(|name| tokenize_text(name).join(" "))
-        .is_some_and(|parent_name| parent_name == normalized_query)
+        .map(|parent_symbol_name| normalize_query(parent_symbol_name))
+        .is_some_and(|parent_symbol_name| parent_symbol_name == normalized_query)
     {
         adjusted_score += 0.1;
     }
@@ -194,7 +200,7 @@ fn normalize_query(query: &str) -> String {
 }
 
 fn is_exact_symbol_match(normalized_query: &str, search_target: &SearchTarget) -> bool {
-    tokenize_text(&search_target.symbol_name).join(" ") == normalized_query
+    search_target.symbol_name_search_text == normalized_query
 }
 
 fn is_primary_direct_kind(target_kind: SearchTargetKind) -> bool {
@@ -284,7 +290,6 @@ fn related_kind_priority(target_kind: SearchTargetKind) -> usize {
 
 struct TantivySearchIndex {
     index: Index,
-    chunk_index_field: Field,
     symbol_name_field: Field,
     signature_field: Field,
     context_field: Field,
@@ -293,7 +298,7 @@ struct TantivySearchIndex {
 impl TantivySearchIndex {
     fn build(search_targets: &[SearchTarget]) -> Result<Self, SearchError> {
         let mut schema_builder = Schema::builder();
-        let chunk_index_field = schema_builder.add_u64_field("chunk_index", STORED);
+        let chunk_index_field = schema_builder.add_u64_field("chunk_index", FAST | STORED);
         let symbol_name_field = schema_builder.add_text_field("symbol_name", TEXT);
         let signature_field = schema_builder.add_text_field("signature_text", TEXT);
         let context_field = schema_builder.add_text_field("context_text", TEXT);
@@ -304,9 +309,9 @@ impl TantivySearchIndex {
         for (chunk_index, search_target) in search_targets.iter().enumerate() {
             index_writer.add_document(doc!(
                 chunk_index_field => chunk_index as u64,
-                symbol_name_field => search_target.symbol_name_search_text.clone(),
-                signature_field => search_target.signature_search_text.clone(),
-                context_field => search_target.context_search_text.clone(),
+                symbol_name_field => search_target.symbol_name_search_text.as_str(),
+                signature_field => search_target.signature_search_text.as_str(),
+                context_field => search_target.context_search_text.as_str(),
             ))?;
         }
 
@@ -314,15 +319,17 @@ impl TantivySearchIndex {
 
         Ok(Self {
             index,
-            chunk_index_field,
             symbol_name_field,
             signature_field,
             context_field,
         })
     }
 
-    fn score_chunks(&self, query: &str, result_limit: usize) -> Result<Vec<(usize, f64)>, SearchError> {
-        let normalized_query = tokenize_text(query).join(" ");
+    fn score_chunks(
+        &self,
+        normalized_query: &str,
+        result_limit: usize,
+    ) -> Result<Vec<(usize, f64)>, SearchError> {
         if normalized_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -336,23 +343,87 @@ impl TantivySearchIndex {
         query_parser.set_field_boost(self.symbol_name_field, 6.0);
         query_parser.set_field_boost(self.signature_field, 3.0);
         query_parser.set_field_boost(self.context_field, 1.0);
-        let parsed_query = query_parser.parse_query(&normalized_query)?;
+        let parsed_query = query_parser.parse_query(normalized_query)?;
         let top_documents =
             searcher.search(&parsed_query, &TopDocs::with_limit(result_limit.max(1)))?;
-        let mut scored_chunks = Vec::new();
+        let chunk_index_readers = searcher
+            .segment_readers()
+            .iter()
+            .map(|segment_reader| {
+                segment_reader
+                    .fast_fields()
+                    .u64("chunk_index")
+                    .map(|column| column.first_or_default_col(0))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut scored_chunks = Vec::with_capacity(top_documents.len());
 
         for (score, document_address) in top_documents {
-            let document: TantivyDocument = searcher.doc(document_address)?;
-            let Some(chunk_index) = document
-                .get_first(self.chunk_index_field)
-                .and_then(|value| value.as_u64())
-            else {
-                continue;
-            };
-
+            let chunk_index = chunk_index_readers[document_address.segment_ord as usize]
+                .get_val(document_address.doc_id);
             scored_chunks.push((chunk_index as usize, score as f64));
         }
 
         Ok(scored_chunks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::model::{
+        SearchMode, SearchTarget, SearchTargetKind, SupportedLanguage,
+    };
+
+    use super::{normalize_query, rank_search_targets};
+
+    #[test]
+    fn rank_search_targets_prioritizes_exact_primary_match_in_direct_mode() {
+        let search_targets = vec![
+            build_search_target(SearchTargetKind::LocalBinding, "log", 30),
+            build_search_target(SearchTargetKind::Function, "log", 10),
+            build_search_target(SearchTargetKind::Method, "logger", 20),
+        ];
+
+        let ranking_artifacts =
+            rank_search_targets("log", SearchMode::Direct, &search_targets).unwrap();
+
+        assert_eq!(ranking_artifacts.scored_targets[0].target_index, 1);
+        assert!(ranking_artifacts.scored_targets[0].is_direct_match);
+        assert!(!ranking_artifacts.scored_targets[1].is_direct_match);
+    }
+
+    fn build_search_target(
+        target_kind: SearchTargetKind,
+        symbol_name: &str,
+        line_start: usize,
+    ) -> SearchTarget {
+        SearchTarget {
+            target_id: format!("src/example.rs#L{line_start}-L{line_start}:{target_kind}:{symbol_name}"),
+            file_path: PathBuf::from("src/example.rs"),
+            language: SupportedLanguage::Rust,
+            target_kind,
+            symbol_name: symbol_name.to_string(),
+            parent_symbol_name: None,
+            line_start,
+            line_end: line_start,
+            symbol_name_search_text: normalize_query(symbol_name),
+            signature_search_text: normalize_query(symbol_name),
+            context_search_text: normalize_query(symbol_name),
+            declaration_snippet: symbol_name.to_string(),
+            signature_text: Some(symbol_name.to_string()),
+            return_type_hint: None,
+            parameter_descriptions: Vec::new(),
+            incoming_dependencies: Vec::new(),
+            outgoing_dependencies: Vec::new(),
+            flow_steps: Vec::new(),
+            call_names: Vec::new(),
+            doc_comment: None,
+            semantic_role: None,
+            sibling_symbol_names: Vec::new(),
+            container_name: None,
+            import_hint: None,
+        }
     }
 }

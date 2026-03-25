@@ -69,11 +69,11 @@ fn build_local_binding_sections(
         if is_inferred {
             declaration_entry
                 .annotations
-                .push(format!("→ 타입: {type_hint}  (추론)"));
+                .push(format!("-> Type: {type_hint} (inferred)"));
         } else {
             declaration_entry
                 .annotations
-                .push(format!("→ 타입: {type_hint}"));
+                .push(format!("-> Type: {type_hint}"));
         }
     }
 
@@ -139,7 +139,7 @@ fn build_callable_sections(
     if let Some(return_type_hint) = &search_target.return_type_hint {
         implementation_entry
             .annotations
-            .push(format!("→ 반환 타입: {return_type_hint}"));
+            .push(format!("-> Return type: {return_type_hint}"));
     }
 
     sections.push(TraceSection {
@@ -415,4 +415,56 @@ fn select_primary_caller(
     });
 
     sorted_candidates.into_iter().next()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use crate::model::{
+        SearchTarget, SearchTargetKind, SupportedLanguage,
+    };
+
+    use super::build_search_hit;
+
+    #[test]
+    fn build_search_hit_uses_english_generated_annotations() {
+        let search_targets = vec![build_callable_target()];
+        let search_hit = build_search_hit(0, 10.0, &search_targets, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            search_hit.sections[0].entries[0].annotations,
+            vec!["-> Return type: String".to_string()]
+        );
+    }
+
+    fn build_callable_target() -> SearchTarget {
+        SearchTarget {
+            target_id: "src/example.rs#L10-L10:function:log".to_string(),
+            file_path: PathBuf::from("src/example.rs"),
+            language: SupportedLanguage::Rust,
+            target_kind: SearchTargetKind::Function,
+            symbol_name: "log".to_string(),
+            parent_symbol_name: None,
+            line_start: 10,
+            line_end: 10,
+            symbol_name_search_text: "log".to_string(),
+            signature_search_text: "log".to_string(),
+            context_search_text: "log".to_string(),
+            declaration_snippet: "fn log() -> String".to_string(),
+            signature_text: Some("fn log() -> String".to_string()),
+            return_type_hint: Some("String".to_string()),
+            parameter_descriptions: Vec::new(),
+            incoming_dependencies: Vec::new(),
+            outgoing_dependencies: Vec::new(),
+            flow_steps: Vec::new(),
+            call_names: Vec::new(),
+            doc_comment: None,
+            semantic_role: None,
+            sibling_symbol_names: Vec::new(),
+            container_name: None,
+            import_hint: None,
+        }
+    }
 }

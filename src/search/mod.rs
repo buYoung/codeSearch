@@ -32,18 +32,25 @@ impl CodeSearchService {
             .map(|file_path| analyze_file(&canonical_directory_path, file_path))
             .collect::<Vec<_>>();
         let mut warning_count = 0usize;
-        let mut search_targets = Vec::new();
+        let mut file_analyses = Vec::new();
+        let mut total_target_count = 0usize;
 
         for file_analysis_result in file_analysis_results {
             match file_analysis_result {
                 Ok(file_analysis) => {
                     warning_count += file_analysis.warning_count;
-                    search_targets.extend(file_analysis.targets);
+                    total_target_count += file_analysis.targets.len();
+                    file_analyses.push(file_analysis);
                 }
                 Err(_) => {
                     warning_count += 1;
                 }
             }
+        }
+
+        let mut search_targets = Vec::with_capacity(total_target_count);
+        for file_analysis in file_analyses {
+            search_targets.extend(file_analysis.targets);
         }
 
         if search_targets.is_empty() {
@@ -61,9 +68,12 @@ impl CodeSearchService {
             caller_index,
         } = ranking::rank_search_targets(&request.query, search_mode, &search_targets)?;
         let matched_target_count = scored_targets.len();
-        let results = scored_targets
+        let limited_scored_targets = scored_targets
             .into_iter()
             .take(request.limit)
+            .collect::<Vec<_>>();
+        let results = limited_scored_targets
+            .into_iter()
             .map(|scored_target| {
                 trace::build_search_hit(
                     scored_target.target_index,

@@ -165,7 +165,7 @@ impl Display for TraceRelation {
             Self::OutgoingDep => "→",
         };
 
-        formatter.write_str(marker)
+        formatter.write_str(marker) 
     }
 }
 
@@ -201,16 +201,16 @@ impl SectionCategory {
 
     pub fn title(&self) -> &'static str {
         match self {
-            Self::Declaration => "선언",
-            Self::DataFlow => "데이터 흐름",
-            Self::Dependency => "의존성",
-            Self::Implementation => "구현",
-            Self::Callers => "상위 호출지점",
-            Self::Test => "테스트",
-            Self::Documentation => "문서",
-            Self::Context => "주변 코드",
-            Self::Usage => "사용법",
-            Self::MatchCode => "매칭 코드",
+            Self::Declaration => "Declaration",
+            Self::DataFlow => "Data Flow",
+            Self::Dependency => "Dependencies",
+            Self::Implementation => "Implementation",
+            Self::Callers => "Callers",
+            Self::Test => "Tests",
+            Self::Documentation => "Documentation",
+            Self::Context => "Context",
+            Self::Usage => "Usage",
+            Self::MatchCode => "Matching Code",
         }
     }
 }
