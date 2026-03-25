@@ -1,111 +1,209 @@
 # code-search
 
-`tree-sitter`와 `tantivy`를 사용해 `Rust`, `Go`, `TypeScript` 코드를 검색하는 Search-First `CLI` PoC입니다. 실행 시점에 디렉터리를 스캔하고, 함수/메서드/로컬 binding 단위 target을 만든 뒤 `BM25`로 hit 중심 trace 결과를 반환합니다.
+[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-자세한 설계 배경은 [docs/code-search-poc.md](/Users/buyonglee/RustroverProjects/code-search/docs/code-search-poc.md), 현재 구현 메모는 [docs/search-implementation.md](/Users/buyonglee/RustroverProjects/code-search/docs/search-implementation.md)를 참고하면 됩니다.
+`tree-sitter`와 `tantivy`를 활용한 구조 인식 코드 검색 CLI입니다. 디렉터리를 스캔하여 함수, 메서드, 타입, 로컬 바인딩 단위의 검색 타겟을 추출하고 BM25 기반 랭킹으로 결과를 반환합니다. AI agent가 바로 소비할 수 있는 JSON 출력을 기본으로 제공합니다.
 
-## 현재 상태
+## Table of Contents
 
-- `search` 명령을 지원하고 `--mode direct|explore`로 탐색 의도를 조절할 수 있습니다
-- 지원 확장자: `.rs`, `.go`, `.ts`, `.tsx`
-- 디렉터리 스캔 시 `.gitignore`와 기본 ignore 규칙을 존중합니다
-- 결과는 hit 중심 trace 형식으로 출력되고, 선언/데이터 흐름/의존성 또는 구현/상위 호출지점을 함께 보여줍니다
-- persistent `index`, `JSON` 출력, semantic search는 아직 구현하지 않았습니다
+- [Features](#features)
+- [Supported Languages](#supported-languages)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Output Formats](#output-formats)
+- [Response Schema](#response-schema)
+- [Documentation](#documentation)
+- [License](#license)
 
-## 요구 사항
+## Features
 
-- `Rust` toolchain
+- **구조 인식 파싱** — `tree-sitter`로 function, method, type, local binding 단위 타겟 추출
+- **BM25 랭킹** — `tantivy` 인메모리 인덱스에서 symbol, signature, context 필드별 boost 적용
+- **검색 모드** — `direct` (정확 매칭 우선) / `explore` (관련 컨텍스트 포함 탐색)
+- **Agent 친화 JSON** — `schema_version`, `target_id`, 구조화된 `sections.location`, `raw_target` 메타데이터 포함
+- **병렬 처리** — `rayon`으로 파일별 파싱/타겟 추출 병렬화
+- **gitignore 존중** — `.gitignore` 및 기본 ignore 규칙 적용
+
+## Supported Languages
+
+| Language   | Extensions       |
+|------------|------------------|
+| Rust       | `.rs`            |
+| Go         | `.go`            |
+| TypeScript | `.ts`, `.tsx`    |
+
+## Architecture
+
+```
+src/
+├── main.rs              # CLI 진입점 (clap 기반)
+├── lib.rs               # 모듈 선언
+├── model.rs             # 핵심 도메인 모델 (SearchTarget, SearchHit, SearchResults 등)
+├── text.rs              # 텍스트 유틸리티
+├── parser/              # tree-sitter 기반 언어별 파서
+│   ├── mod.rs
+│   ├── rust.rs
+│   ├── go.rs
+│   └── typescript.rs
+├── search/              # 검색 엔진 코어
+│   ├── mod.rs           # CodeSearchService
+│   ├── discovery.rs     # 파일 디스커버리
+│   ├── ranking.rs       # tantivy BM25 랭킹
+│   ├── trace.rs         # 결과 trace/section 구성
+│   └── validation.rs    # 입력 검증
+└── output/              # 출력 렌더링
+    ├── mod.rs           # OutputFormat, render_search_output
+    ├── response.rs      # JSON 응답 구조체
+    ├── json.rs          # JSON 렌더러
+    └── text.rs          # Human-readable 텍스트 렌더러
+```
+
+## Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) toolchain (edition 2024)
 - `cargo`
 
-## 실행 명령어
+## Installation
 
-개발 실행:
-
-```text
-cargo run -- search <directoryPath> <query> --limit 10 --mode direct
+```bash
+git clone https://github.com/<your-username>/code-search.git
+cd code-search
+cargo build --release
 ```
 
-빌드 후 실행:
+빌드된 바이너리는 `./target/release/code-search`에 생성됩니다.
 
-```text
-cargo build
-./target/debug/code-search search <directoryPath> <query> --limit 10 --mode direct
+## Usage
+
+```
+code-search search <DIRECTORY_PATH> <QUERY> [OPTIONS]
 ```
 
-도움말에 해당하는 usage:
+### Options
 
-```text
-code-search search <directoryPath> <query> [--limit <number>] [--mode <direct|explore>]
-```
+| Option     | Default   | Description                          |
+|------------|-----------|--------------------------------------|
+| `--limit`  | `10`      | 반환할 최대 결과 수                  |
+| `--mode`   | `direct`  | 검색 모드 (`direct` \| `explore`)    |
+| `--output` | `json`    | 출력 형식 (`json` \| `text`)         |
 
-- 공백이 들어가는 query는 `"http client retry"`처럼 따옴표로 감싸는 편이 안전합니다
-- `--mode` 기본값은 `direct`입니다
+### Examples
 
-## 예시 명령어
-
-현재 저장소에서 `search` 키워드 찾기:
-
-```text
+```bash
+# 현재 디렉터리에서 "search" 키워드 검색
 cargo run -- search . search --limit 3
-```
 
-현재 저장소에서 `CodeSearchService` 심볼 찾기:
+# src/ 하위에서 특정 심볼 검색
+cargo run -- search ./src CodeSearchService --limit 5
 
-```text
-cargo run -- search . CodeSearchService --limit 5
-```
-
-관련 맥락까지 넓게 탐색:
-
-```text
+# explore 모드로 관련 컨텍스트 탐색
 cargo run -- search ./src analyze_file --limit 5 --mode explore
-```
 
-`src` 디렉터리만 대상으로 `parse` 관련 코드 찾기:
+# human-readable 텍스트 출력
+cargo run -- search ./src CodeSearchService --limit 5 --output text
 
-```text
-cargo run -- search ./src parse --limit 5
-```
-
-여러 단어 query로 검색:
-
-```text
+# 다중 단어 쿼리
 cargo run -- search ~/workspace/my-repo "http client retry" --limit 10
 ```
 
-## 출력 예시
+> **Tip:** 공백이 포함된 쿼리는 따옴표로 감싸세요.
 
-```text
-Scanned files: 1
-Matched targets: 4
+## Output Formats
+
+### JSON (default)
+
+```json
+{
+  "schema_version": 1,
+  "query": "CodeSearchService",
+  "mode": "direct",
+  "stats": {
+    "scanned_file_count": 17,
+    "matched_target_count": 172,
+    "warning_count": 0
+  },
+  "results": [
+    {
+      "score": 15.078,
+      "target_id": "search/mod.rs#L11-L11:type:CodeSearchService",
+      "target_kind": "type",
+      "symbol_name": "CodeSearchService",
+      "file_path": "search/mod.rs",
+      "language": "rust",
+      "line_start": 11,
+      "line_end": 11,
+      "sections": [ ... ],
+      "raw_target": { ... }
+    }
+  ]
+}
+```
+
+### Text (`--output text`)
+
+```
+Scanned files: 17
+Matched targets: 172
 Warnings: 0
 
-질문: 'clinicalReviewQuery'
+질문: 'CodeSearchService'
 Mode: direct
 
 ━━━ Direct matches ━━━
 
-결과 1  local  clinicalReviewQuery  rpm99091.service.ts:5  [exact]  score=8.550
+결과 1  type  CodeSearchService  search/mod.rs:11  [exact]  score=15.079
 
 ━━━ 선언 ━━━
-  const clinicalReviewQuery = this.rpm99091Repository.findRPM99091ClinicalReview(query);
-    → 위치: getClinicalReview() @ rpm99091.service.ts:5
+  pub struct CodeSearchService
+    → 위치: search/mod.rs:11
 
-━━━ 데이터 흐름 ━━━
-  clinicalReviewQuery
-  ↓ combineLatest([clinicalReviewQuery, patientInfoQuery])
-  ↓ map(([clinicalReviewData, patientInfo]) => { ... })
+━━━ 사용법 ━━━
+  use crate::search::CodeSearchService;
 ```
 
-- `Scanned files`: 검색 대상으로 본 지원 파일 수
-- `Matched targets`: 검색어와 매칭된 target 수
-- `Warnings`: parse 실패 등으로 fallback 처리한 횟수
-- `Direct matches`: exact symbol lookup에 가까운 결과
-- `Related matches`: exact match 주변의 관련 구현/흐름 결과
+### Error Response
 
-## 구현 요약
+런타임 에러 발생 시 JSON 에러 응답과 non-zero exit code를 반환합니다.
 
-- `tree-sitter`로 function, method, type, local binding target을 추출합니다
-- 파일별 parsing/target 추출은 `rayon`으로 병렬 처리합니다
-- 각 target에서 `symbol`, `signature`, `context` 검색 field를 만듭니다
-- in-memory `tantivy` 인덱스에서 field별 boost를 적용해 `BM25`로 점수화하고, `direct` 모드에서는 exact symbol 결과를 먼저 배치합니다
+```json
+{
+  "error": {
+    "kind": "invalid_request",
+    "message": "query must include at least one searchable token"
+  }
+}
+```
+
+## Response Schema
+
+| Field | Description |
+|-------|-------------|
+| `schema_version` | 응답 스키마 버전 |
+| `query` | 실행된 검색 쿼리 |
+| `mode` | 검색 모드 (`direct` \| `explore`) |
+| `stats.scanned_file_count` | 스캔된 지원 파일 수 |
+| `stats.matched_target_count` | 매칭된 타겟 수 |
+| `stats.warning_count` | 파싱 실패 등 fallback 처리 횟수 |
+| `results[].target_id` | `file + line range + kind + symbol` 기반 식별자 |
+| `results[].target_kind` | `function` \| `method` \| `type` \| `local_binding` |
+| `results[].sections[].entries[].location` | `file_path`, `line_start`, `line_end` 구조화 위치 |
+| `results[].raw_target` | signature, dependency, flow, parent symbol 등 메타데이터 |
+
+## Documentation
+
+- [설계 배경 (PoC)](docs/code-search-poc.md)
+- [구현 메모](docs/search-implementation.md)
+- [Agent-first 리팩터링 계획](docs/agent-first-refactor-execution-plan.md)
+
+## Roadmap
+
+- [ ] Persistent index 지원
+- [ ] Semantic search 통합
+- [ ] `read-file` / `read-range` 명령 추가
+
+## License
+
+이 프로젝트는 [MIT License](LICENSE) 하에 배포됩니다.
