@@ -1,11 +1,19 @@
+mod go;
+mod rust;
+mod typescript;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use self::go::extract_go_binding_descriptors;
+use self::rust::extract_rust_binding_descriptors;
+use self::typescript::extract_typescript_binding_descriptors;
 use tree_sitter::{Node, Parser};
 
 use crate::model::{
-    NamedText, SearchTarget, SearchTargetKind, SupportedLanguage, TraceReference, TraceStep,
+    build_target_id, NamedText, SearchTarget, SearchTargetKind, SupportedLanguage,
+    TraceReference, TraceStep,
 };
 use crate::text::{condense_whitespace, tokenize_text, truncate_text};
 
@@ -23,10 +31,10 @@ struct SourceContext<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct BindingDescriptor<'tree> {
-    display_node: Node<'tree>,
-    initializer_node: Option<Node<'tree>>,
-    name_node: Node<'tree>,
+pub(super) struct BindingDescriptor<'tree> {
+    pub(super) display_node: Node<'tree>,
+    pub(super) initializer_node: Option<Node<'tree>>,
+    pub(super) name_node: Node<'tree>,
 }
 
 struct CallReference {
@@ -125,11 +133,12 @@ fn build_primary_target(
     context: &SourceContext<'_>,
 ) -> Option<SearchTarget> {
     let symbol_name = extract_symbol_name(node, context.source_bytes)?;
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
     let node_text = extract_node_text(node, context.source_bytes);
     let comment_text = collect_preceding_comments(context.source_lines, node.start_position().row + 1);
     let signature_text = extract_signature_text(&node_text);
     let declaration_snippet = build_single_line_snippet(&signature_text);
-    let display_snippet = build_display_snippet(&comment_text, &node_text);
     let token_text = tokenize_text(&node_text).join(" ");
     let parameter_descriptions = collect_parameter_descriptions(
         node.child_by_field_name("parameters"),
@@ -169,27 +178,40 @@ fn build_primary_target(
         Some(comment_text.clone())
     };
     let semantic_role = classify_semantic_role(node, &symbol_name, context.language, context.source_bytes);
-    let import_hint = if matches!(target_kind, SearchTargetKind::Function | SearchTargetKind::Method | SearchTargetKind::Type) {
-        build_import_hint(&symbol_name, context.relative_file_path, context.language)
+    let import_hint = if matches!(target_kind, SearchTargetKind::Function | SearchTargetKind::Type)
+    {
+        build_import_hint(
+            &symbol_name,
+            context.relative_file_path,
+            context.language,
+            target_kind,
+        )
     } else {
         None
     };
     let symbol_name_search_text = build_search_text(&[symbol_name.clone()]);
     let signature_search_text = build_search_text(&signature_search_parts);
     let context_search_text = build_search_text(&context_search_parts);
+    let target_id = build_target_id(
+        context.relative_file_path,
+        line_start,
+        line_end,
+        target_kind,
+        &symbol_name,
+    );
 
     Some(SearchTarget {
+        target_id,
         file_path: context.relative_file_path.to_path_buf(),
         language: context.language,
         target_kind,
         symbol_name,
-        enclosing_symbol_name: None,
-        line_start: node.start_position().row + 1,
-        line_end: node.end_position().row + 1,
+        parent_symbol_name: None,
+        line_start,
+        line_end,
         symbol_name_search_text,
         signature_search_text,
         context_search_text,
-        display_snippet,
         declaration_snippet,
         signature_text: if signature_text.is_empty() {
             None
@@ -257,6 +279,8 @@ fn build_local_binding_target(
         return None;
     }
 
+    let line_start = descriptor.display_node.start_position().row + 1;
+    let line_end = descriptor.display_node.end_position().row + 1;
     let declaration_text = extract_node_text(descriptor.display_node, context.source_bytes);
     let declaration_snippet = build_single_line_snippet(&declaration_text);
     let explicit_type_hint = extract_explicit_binding_type_hint(descriptor.display_node, context.source_bytes);
@@ -319,19 +343,26 @@ fn build_local_binding_target(
             .collect::<Vec<_>>(),
     );
     let context_search_text = build_search_text(&context_search_parts);
+    let target_id = build_target_id(
+        context.relative_file_path,
+        line_start,
+        line_end,
+        SearchTargetKind::LocalBinding,
+        &symbol_name,
+    );
 
     Some(SearchTarget {
+        target_id,
         file_path: context.relative_file_path.to_path_buf(),
         language: context.language,
         target_kind: SearchTargetKind::LocalBinding,
         symbol_name,
-        enclosing_symbol_name: Some(callable_target.symbol_name.clone()),
-        line_start: descriptor.display_node.start_position().row + 1,
-        line_end: descriptor.display_node.end_position().row + 1,
+        parent_symbol_name: Some(callable_target.symbol_name.clone()),
+        line_start,
+        line_end,
         symbol_name_search_text,
         signature_search_text,
         context_search_text,
-        display_snippet: build_display_snippet("", &declaration_text),
         declaration_snippet,
         signature_text: None,
         return_type_hint: explicit_type_hint,
@@ -374,135 +405,6 @@ fn extract_binding_descriptors<'tree>(
         SupportedLanguage::Go => extract_go_binding_descriptors(node, context.source_bytes),
         SupportedLanguage::Rust => extract_rust_binding_descriptors(node, context.source_bytes),
     }
-}
-
-fn extract_typescript_binding_descriptors<'tree>(
-    node: Node<'tree>,
-    source_bytes: &[u8],
-) -> Vec<BindingDescriptor<'tree>> {
-    if node.kind() != "variable_declarator" {
-        return Vec::new();
-    }
-
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return Vec::new();
-    };
-    if name_node.kind() != "identifier" {
-        return Vec::new();
-    }
-
-    let mut display_node = node;
-    if let Some(parent_node) = node.parent() {
-        if parent_node.kind() == "variable_declaration" {
-            display_node = parent_node;
-            if let Some(grand_parent_node) = parent_node.parent() {
-                if grand_parent_node.kind() == "lexical_declaration" {
-                    display_node = grand_parent_node;
-                }
-            }
-        } else if parent_node.kind() == "lexical_declaration" {
-            display_node = parent_node;
-        }
-    }
-
-    if extract_node_text(name_node, source_bytes).is_empty() {
-        return Vec::new();
-    }
-
-    vec![BindingDescriptor {
-        display_node,
-        initializer_node: node.child_by_field_name("value"),
-        name_node,
-    }]
-}
-
-fn extract_go_binding_descriptors<'tree>(
-    node: Node<'tree>,
-    source_bytes: &[u8],
-) -> Vec<BindingDescriptor<'tree>> {
-    match node.kind() {
-        "short_var_declaration" => {
-            let Some(left_node) = node.child_by_field_name("left") else {
-                return Vec::new();
-            };
-            let Some(right_node) = node.child_by_field_name("right") else {
-                return Vec::new();
-            };
-            let left_items = collect_named_children(left_node);
-            let right_items = collect_named_children(right_node);
-
-            left_items
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, name_node)| {
-                    if name_node.kind() != "identifier" {
-                        return None;
-                    }
-                    if extract_node_text(name_node, source_bytes).is_empty() {
-                        return None;
-                    }
-
-                    Some(BindingDescriptor {
-                        display_node: node,
-                        initializer_node: right_items.get(index).copied(),
-                        name_node,
-                    })
-                })
-                .collect()
-        }
-        "var_spec" => {
-            let value_items = node
-                .child_by_field_name("value")
-                .map(collect_named_children)
-                .unwrap_or_default();
-            let mut value_index = 0usize;
-            let mut descriptors = Vec::new();
-
-            for child in collect_named_children(node) {
-                if child.kind() != "identifier" {
-                    continue;
-                }
-                if extract_node_text(child, source_bytes).is_empty() {
-                    continue;
-                }
-
-                descriptors.push(BindingDescriptor {
-                    display_node: node,
-                    initializer_node: value_items.get(value_index).copied(),
-                    name_node: child,
-                });
-                value_index += 1;
-            }
-
-            descriptors
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn extract_rust_binding_descriptors<'tree>(
-    node: Node<'tree>,
-    source_bytes: &[u8],
-) -> Vec<BindingDescriptor<'tree>> {
-    if node.kind() != "let_declaration" {
-        return Vec::new();
-    }
-
-    let Some(pattern_node) = node.child_by_field_name("pattern") else {
-        return Vec::new();
-    };
-    if pattern_node.kind() != "identifier" {
-        return Vec::new();
-    }
-    if extract_node_text(pattern_node, source_bytes).is_empty() {
-        return Vec::new();
-    }
-
-    vec![BindingDescriptor {
-        display_node: node,
-        initializer_node: node.child_by_field_name("value"),
-        name_node: pattern_node,
-    }]
 }
 
 fn collect_local_binding_flow_steps(
@@ -923,13 +825,6 @@ fn extract_explicit_binding_type_hint(
 fn build_fallback_target(context: &SourceContext<'_>) -> SearchTarget {
     let source_lines = context.source.lines().collect::<Vec<_>>();
     let line_end = source_lines.len().max(1);
-    let snippet = source_lines
-        .iter()
-        .take(6)
-        .map(|line| condense_whitespace(line))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
     let file_name = context
         .relative_file_path
         .file_name()
@@ -938,19 +833,26 @@ fn build_fallback_target(context: &SourceContext<'_>) -> SearchTarget {
         .to_string();
 
     let symbol_name_search_text = build_search_text(&[file_name.clone()]);
+    let target_id = build_target_id(
+        context.relative_file_path,
+        1,
+        line_end,
+        SearchTargetKind::File,
+        &file_name,
+    );
 
     SearchTarget {
+        target_id,
         file_path: context.relative_file_path.to_path_buf(),
         language: context.language,
         target_kind: SearchTargetKind::File,
         symbol_name: file_name,
-        enclosing_symbol_name: None,
+        parent_symbol_name: None,
         line_start: 1,
         line_end,
         symbol_name_search_text,
         signature_search_text: String::new(),
         context_search_text: tokenize_text(context.source).join(" "),
-        display_snippet: truncate_text(&snippet, 400),
         declaration_snippet: truncate_text(&build_single_line_snippet(context.source), 200),
         signature_text: None,
         return_type_hint: None,
@@ -974,7 +876,7 @@ fn classify_primary_target_kind(
     match language {
         SupportedLanguage::Rust => match node.kind() {
             "function_item" => {
-                if node.parent().map_or(false, |p| p.kind() == "impl_item") {
+                if is_rust_impl_member(node) {
                     Some(SearchTargetKind::Method)
                 } else {
                     Some(SearchTargetKind::Function)
@@ -1006,6 +908,19 @@ fn is_nested_scope(node: Node<'_>, language: SupportedLanguage) -> bool {
         classify_primary_target_kind(node, language),
         Some(SearchTargetKind::Function | SearchTargetKind::Method)
     )
+}
+
+fn is_rust_impl_member(node: Node<'_>) -> bool {
+    let Some(parent_node) = node.parent() else {
+        return false;
+    };
+    if parent_node.kind() == "impl_item" {
+        return true;
+    }
+
+    parent_node
+        .parent()
+        .is_some_and(|grand_parent_node| grand_parent_node.kind() == "impl_item")
 }
 
 fn language_grammar(language: SupportedLanguage) -> tree_sitter::Language {
@@ -1417,14 +1332,14 @@ fn collect_preceding_comments(source_lines: &[String], line_start: usize) -> Str
     comment_lines.join("\n")
 }
 
-fn extract_node_text(node: Node<'_>, source_bytes: &[u8]) -> String {
+pub(super) fn extract_node_text(node: Node<'_>, source_bytes: &[u8]) -> String {
     node.utf8_text(source_bytes)
         .map(str::trim)
         .unwrap_or_default()
         .to_string()
 }
 
-fn collect_named_children(node: Node<'_>) -> Vec<Node<'_>> {
+pub(super) fn collect_named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .filter(|child| child.is_named())
@@ -1573,16 +1488,21 @@ fn build_import_hint(
     symbol_name: &str,
     relative_file_path: &Path,
     language: SupportedLanguage,
+    target_kind: SearchTargetKind,
 ) -> Option<String> {
     let path_str = relative_file_path.to_str()?;
 
     match language {
         SupportedLanguage::Rust => {
+            if target_kind == SearchTargetKind::Method {
+                return None;
+            }
             // src/service.rs + CodeSearchService -> use crate::service::CodeSearchService;
             let module_path = path_str
                 .trim_start_matches("src/")
                 .trim_end_matches(".rs")
                 .replace('/', "::");
+            let module_path = module_path.trim_end_matches("::mod").to_string();
             let module_path = if module_path == "lib" || module_path == "main" {
                 return Some(format!("use crate::{symbol_name};"));
             } else {
@@ -1591,6 +1511,9 @@ fn build_import_hint(
             Some(format!("use crate::{module_path}::{symbol_name};"))
         }
         SupportedLanguage::TypeScript => {
+            if target_kind == SearchTargetKind::Method {
+                return None;
+            }
             let module_path = path_str
                 .trim_end_matches(".ts")
                 .trim_end_matches(".tsx");
@@ -1618,6 +1541,9 @@ fn populate_sibling_context(
         for block in &container_blocks {
             if target.line_start >= block.line_start && target.line_end <= block.line_end {
                 target.container_name = Some(block.container_name.clone());
+                if target.target_kind == SearchTargetKind::Method {
+                    target.parent_symbol_name = Some(block.container_name.clone());
+                }
                 target.sibling_symbol_names = block
                     .member_names
                     .iter()

@@ -1,11 +1,13 @@
 mod model;
+mod output;
 mod parser;
-mod service;
-mod tantivy_search;
+mod search;
 mod text;
 
 pub use model::{
-    SearchError, SearchMode, SearchRequest, SearchResults, SearchTargetKind, SearchTraceResult,
-    SupportedLanguage, TraceEntry, TraceRelationship, TraceSection,
+    build_target_id, NamedText, SearchError, SearchHit, SearchMode, SearchRawTarget, SearchRequest,
+    SearchResults, SearchTargetKind, SectionCategory, SupportedLanguage, TraceEntry, TraceLocation,
+    TraceReference, TraceRelation, TraceSection, TraceStep,
 };
-pub use service::CodeSearchService;
+pub use output::{render_runtime_error, render_search_output, OutputFormat};
+pub use search::CodeSearchService;
