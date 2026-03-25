@@ -26,8 +26,18 @@ struct SourceContext<'a> {
     language: SupportedLanguage,
     relative_file_path: &'a Path,
     source_bytes: &'a [u8],
-    source_lines: &'a [String],
+    source_lines: &'a [&'a str],
     source: &'a str,
+}
+
+struct ContainerContext {
+    container_name: String,
+    member_names: Vec<String>,
+}
+
+#[derive(Default)]
+struct TraversalState {
+    top_level_target_indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -61,7 +71,7 @@ pub(crate) fn analyze_file(
 
     let source = fs::read_to_string(absolute_file_path)?;
     let relative_file_path = make_relative_path(search_root_path, absolute_file_path);
-    let source_lines = source.lines().map(str::to_string).collect::<Vec<_>>();
+    let source_lines = source.lines().collect::<Vec<_>>();
     let source_bytes = source.as_bytes();
     let context = SourceContext {
         language,
@@ -88,13 +98,19 @@ pub(crate) fn analyze_file(
     };
 
     let mut targets = Vec::new();
-    collect_targets(parsed_tree.root_node(), &context, &mut targets);
+    let mut traversal_state = TraversalState::default();
+    collect_targets(
+        parsed_tree.root_node(),
+        &context,
+        &mut traversal_state,
+        &mut targets,
+        None,
+    );
 
     if targets.is_empty() {
         targets.push(build_fallback_target(&context));
     }
-
-    populate_sibling_context(parsed_tree.root_node(), &context, &mut targets);
+    populate_top_level_sibling_context(&mut targets, &traversal_state.top_level_target_indices);
 
     let warning_count = if parsed_tree.root_node().has_error() { 1 } else { 0 };
 
@@ -107,30 +123,40 @@ pub(crate) fn analyze_file(
 fn collect_targets(
     node: Node<'_>,
     context: &SourceContext<'_>,
+    traversal_state: &mut TraversalState,
     targets: &mut Vec<SearchTarget>,
+    current_container: Option<&ContainerContext>,
 ) {
+    let container_context = build_container_context(node, context);
+    let active_container = container_context.as_ref().or(current_container);
+
     if let Some(target_kind) = classify_primary_target_kind(node, context.language) {
-        if let Some(primary_target) = build_primary_target(node, target_kind, context) {
+        if let Some(primary_target) = build_primary_target(node, target_kind, context, active_container)
+        {
             let local_binding_targets = if target_kind.is_callable() {
-                build_local_binding_targets(node, &primary_target, context)
+                build_local_binding_targets(node, &primary_target, context, active_container)
             } else {
                 Vec::new()
             };
+            if primary_target.container_name.is_none() {
+                traversal_state.top_level_target_indices.push(targets.len());
+            }
 
             targets.push(primary_target);
             targets.extend(local_binding_targets);
         }
     }
 
-    for child in collect_named_children(node) {
-        collect_targets(child, context, targets);
-    }
+    visit_named_children(node, |child| {
+        collect_targets(child, context, traversal_state, targets, active_container);
+    });
 }
 
 fn build_primary_target(
     node: Node<'_>,
     target_kind: SearchTargetKind,
     context: &SourceContext<'_>,
+    current_container: Option<&ContainerContext>,
 ) -> Option<SearchTarget> {
     let symbol_name = extract_symbol_name(node, context.source_bytes)?;
     let line_start = node.start_position().row + 1;
@@ -192,6 +218,25 @@ fn build_primary_target(
     let symbol_name_search_text = build_search_text(&[symbol_name.clone()]);
     let signature_search_text = build_search_text(&signature_search_parts);
     let context_search_text = build_search_text(&context_search_parts);
+    let container_name = current_container.map(|container| container.container_name.clone());
+    let sibling_symbol_names = current_container
+        .map(|container| {
+            container
+                .member_names
+                .iter()
+                .filter(|name| *name != &symbol_name)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let parent_symbol_name = if target_kind == SearchTargetKind::Method {
+        container_name.clone()
+    } else {
+        None
+    };
+    let parent_symbol_name_search_text = parent_symbol_name
+        .as_ref()
+        .map(|name| tokenize_text(name).join(" "));
     let target_id = build_target_id(
         context.relative_file_path,
         line_start,
@@ -206,7 +251,8 @@ fn build_primary_target(
         language: context.language,
         target_kind,
         symbol_name,
-        parent_symbol_name: None,
+        parent_symbol_name,
+        parent_symbol_name_search_text,
         line_start,
         line_end,
         symbol_name_search_text,
@@ -226,8 +272,8 @@ fn build_primary_target(
         call_names,
         doc_comment,
         semantic_role,
-        sibling_symbol_names: Vec::new(),
-        container_name: None,
+        sibling_symbol_names,
+        container_name,
         import_hint,
     })
 }
@@ -236,6 +282,7 @@ fn build_local_binding_targets(
     callable_node: Node<'_>,
     callable_target: &SearchTarget,
     context: &SourceContext<'_>,
+    current_container: Option<&ContainerContext>,
 ) -> Vec<SearchTarget> {
     let Some(body_node) = callable_node.child_by_field_name("body") else {
         return Vec::new();
@@ -262,6 +309,7 @@ fn build_local_binding_targets(
                 descriptor,
                 &parameter_map,
                 context,
+                current_container,
             )
         })
         .collect()
@@ -273,6 +321,7 @@ fn build_local_binding_target(
     descriptor: BindingDescriptor<'_>,
     parameter_map: &HashMap<String, String>,
     context: &SourceContext<'_>,
+    current_container: Option<&ContainerContext>,
 ) -> Option<SearchTarget> {
     let symbol_name = extract_node_text(descriptor.name_node, context.source_bytes);
     if symbol_name.is_empty() {
@@ -343,6 +392,17 @@ fn build_local_binding_target(
             .collect::<Vec<_>>(),
     );
     let context_search_text = build_search_text(&context_search_parts);
+    let container_name = current_container.map(|container| container.container_name.clone());
+    let sibling_symbol_names = current_container
+        .map(|container| {
+            container
+                .member_names
+                .iter()
+                .filter(|name| *name != &symbol_name)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let target_id = build_target_id(
         context.relative_file_path,
         line_start,
@@ -358,6 +418,7 @@ fn build_local_binding_target(
         target_kind: SearchTargetKind::LocalBinding,
         symbol_name,
         parent_symbol_name: Some(callable_target.symbol_name.clone()),
+        parent_symbol_name_search_text: Some(tokenize_text(&callable_target.symbol_name).join(" ")),
         line_start,
         line_end,
         symbol_name_search_text,
@@ -373,8 +434,8 @@ fn build_local_binding_target(
         call_names,
         doc_comment: None,
         semantic_role: None,
-        sibling_symbol_names: Vec::new(),
-        container_name: None,
+        sibling_symbol_names,
+        container_name,
         import_hint: None,
     })
 }
@@ -391,7 +452,12 @@ fn collect_local_binding_descriptors<'tree>(
 
     binding_descriptors.extend(extract_binding_descriptors(node, context));
 
-    for child in collect_named_children(node) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+
         collect_local_binding_descriptors(child, scope_root, context, binding_descriptors);
     }
 }
@@ -462,7 +528,7 @@ fn collect_direct_binding_use_steps(
         }
     }
 
-    for child in collect_named_children(node) {
+    visit_named_children(node, |child| {
         collect_direct_binding_use_steps(
             child,
             scope_root,
@@ -471,7 +537,7 @@ fn collect_direct_binding_use_steps(
             context,
             flow_steps,
         );
-    }
+    });
 }
 
 fn collect_typescript_chain_flow_steps(
@@ -497,7 +563,7 @@ fn collect_typescript_chain_flow_steps(
         ));
     }
 
-    for child in collect_named_children(node) {
+    visit_named_children(node, |child| {
         collect_typescript_chain_flow_steps(
             child,
             scope_root,
@@ -506,7 +572,7 @@ fn collect_typescript_chain_flow_steps(
             context,
             flow_steps,
         );
-    }
+    });
 }
 
 fn collect_typescript_chain_steps_for_identifier(
@@ -569,9 +635,9 @@ fn collect_alias_use_steps(
         }
     }
 
-    for child in collect_named_children(node) {
+    visit_named_children(node, |child| {
         collect_alias_use_steps(child, scope_root, alias_name, context, flow_steps);
-    }
+    });
 }
 
 fn collect_incoming_dependencies(
@@ -651,7 +717,7 @@ fn collect_incoming_dependencies_in_node(
         return;
     }
 
-    for child in collect_named_children(node) {
+    visit_named_children(node, |child| {
         collect_incoming_dependencies_in_node(
             child,
             binding_name,
@@ -659,7 +725,7 @@ fn collect_incoming_dependencies_in_node(
             context,
             dependencies,
         );
-    }
+    });
 }
 
 fn collect_call_references_in_scope(
@@ -685,9 +751,9 @@ fn collect_call_references_in_scope_node(
         call_references.push(call_reference);
     }
 
-    for child in collect_named_children(node) {
+    visit_named_children(node, |child| {
         collect_call_references_in_scope_node(child, scope_root, context, call_references);
-    }
+    });
 }
 
 fn collect_call_references_in_expression(
@@ -708,9 +774,9 @@ fn collect_call_references_in_expression_node(
         call_references.push(call_reference);
     }
 
-    for child in collect_named_children(node) {
+    visit_named_children(node, |child| {
         collect_call_references_in_expression_node(child, context, call_references);
-    }
+    });
 }
 
 fn extract_call_reference(
@@ -755,19 +821,19 @@ fn collect_parameter_descriptions(
     let mut descriptions = Vec::new();
     let mut seen_names = HashSet::new();
 
-    for child in collect_named_children(parameters_node) {
+    visit_named_children(parameters_node, |child| {
         let Some(parameter_name) = extract_parameter_name(child, source_bytes) else {
-            continue;
+            return;
         };
         if !seen_names.insert(parameter_name.clone()) {
-            continue;
+            return;
         }
 
         descriptions.push(NamedText {
             name: parameter_name,
             text: build_single_line_snippet(&extract_node_text(child, source_bytes)),
         });
-    }
+    });
 
     descriptions
 }
@@ -808,15 +874,22 @@ fn extract_explicit_binding_type_hint(
         }
     }
 
-    for child in collect_named_children(declaration_node) {
-        if child.kind() == "variable_declarator" {
-            if let Some(type_node) = child.child_by_field_name("type") {
-                let type_text = normalize_type_text(&extract_node_text(type_node, source_bytes));
-                if !type_text.is_empty() {
-                    return Some(type_text);
-                }
+    let mut explicit_type_hint = None;
+    visit_named_children(declaration_node, |child| {
+        if explicit_type_hint.is_some() || child.kind() != "variable_declarator" {
+            return;
+        }
+
+        if let Some(type_node) = child.child_by_field_name("type") {
+            let type_text = normalize_type_text(&extract_node_text(type_node, source_bytes));
+            if !type_text.is_empty() {
+                explicit_type_hint = Some(type_text);
             }
         }
+    });
+
+    if explicit_type_hint.is_some() {
+        return explicit_type_hint;
     }
 
     None
@@ -848,6 +921,7 @@ fn build_fallback_target(context: &SourceContext<'_>) -> SearchTarget {
         target_kind: SearchTargetKind::File,
         symbol_name: file_name,
         parent_symbol_name: None,
+        parent_symbol_name_search_text: None,
         line_start: 1,
         line_end,
         symbol_name_search_text,
@@ -957,13 +1031,16 @@ fn extract_first_identifier(node: Node<'_>, source_bytes: &[u8]) -> Option<Strin
         }
     }
 
-    for child in collect_named_children(node) {
-        if let Some(identifier) = extract_first_identifier(child, source_bytes) {
-            return Some(identifier);
+    let mut first_identifier = None;
+    visit_named_children(node, |child| {
+        if first_identifier.is_some() {
+            return;
         }
-    }
 
-    None
+        first_identifier = extract_first_identifier(child, source_bytes);
+    });
+
+    first_identifier
 }
 
 fn extract_terminal_identifier(node: Node<'_>, source_bytes: &[u8]) -> Option<String> {
@@ -984,9 +1061,9 @@ fn collect_terminal_identifier(
         }
     }
 
-    for child in collect_named_children(node) {
+    visit_named_children(node, |child| {
         collect_terminal_identifier(child, source_bytes, terminal_identifier);
-    }
+    });
 }
 
 fn find_relevant_flow_container<'tree>(
@@ -1108,7 +1185,12 @@ fn collect_flow_operator_calls_in_node<'tree>(
         }
     }
 
-    for child in collect_named_children(node) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+
         collect_flow_operator_calls_in_node(child, scope_root, context, operator_calls);
     }
 }
@@ -1126,18 +1208,38 @@ fn resolve_typescript_map_alias<'tree>(
         }
 
         let arguments_node = operator_call.child_by_field_name("arguments")?;
-        let callback_node = collect_named_children(arguments_node)
-            .into_iter()
-            .find(|node| matches!(node.kind(), "arrow_function" | "function_expression"))?;
+        let mut callback_node = None;
+        let mut arguments_cursor = arguments_node.walk();
+        for child in arguments_node.children(&mut arguments_cursor) {
+            if !child.is_named() {
+                continue;
+            }
+            if matches!(child.kind(), "arrow_function" | "function_expression") {
+                callback_node = Some(child);
+                break;
+            }
+        }
+        let callback_node = callback_node?;
         let callback_body = callback_node
             .child_by_field_name("body")
             .unwrap_or(callback_node);
         let array_pattern = find_descendant_kind(callback_node, "array_pattern")?;
-        let identifiers = collect_named_children(array_pattern)
-            .into_iter()
-            .filter(|child| child.kind() == "identifier")
-            .collect::<Vec<_>>();
-        let alias_node = identifiers.get(binding_position).copied()?;
+        let mut identifier_index = 0usize;
+        let mut alias_node = None;
+        let mut array_cursor = array_pattern.walk();
+        for child in array_pattern.children(&mut array_cursor) {
+            if !child.is_named() || child.kind() != "identifier" {
+                continue;
+            }
+
+            if identifier_index == binding_position {
+                alias_node = Some(child);
+                break;
+            }
+
+            identifier_index += 1;
+        }
+        let alias_node = alias_node?;
         let alias_name = extract_node_text(alias_node, context.source_bytes);
         if alias_name.is_empty() {
             return None;
@@ -1157,7 +1259,12 @@ fn find_descendant_kind<'tree>(
         return Some(node);
     }
 
-    for child in collect_named_children(node) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+
         if let Some(found_node) = find_descendant_kind(child, target_kind) {
             return Some(found_node);
         }
@@ -1211,9 +1318,22 @@ fn find_child_position(
     parent_node: Node<'_>,
     child_node: Node<'_>,
 ) -> Option<usize> {
-    collect_named_children(parent_node)
-        .iter()
-        .position(|candidate| node_is_within(child_node, *candidate))
+    let mut child_position = None;
+    let mut current_position = 0usize;
+    visit_named_children(parent_node, |candidate| {
+        if child_position.is_some() {
+            return;
+        }
+
+        if node_is_within(child_node, candidate) {
+            child_position = Some(current_position);
+            return;
+        }
+
+        current_position += 1;
+    });
+
+    child_position
 }
 
 fn member_base_node(
@@ -1240,12 +1360,21 @@ fn normalize_type_text(text: &str) -> String {
 }
 
 fn build_search_text(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|part| condense_whitespace(part))
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut search_text = String::new();
+
+    for part in parts {
+        let condensed_part = condense_whitespace(part);
+        if condensed_part.is_empty() {
+            continue;
+        }
+
+        if !search_text.is_empty() {
+            search_text.push('\n');
+        }
+        search_text.push_str(&condensed_part);
+    }
+
+    search_text
 }
 
 fn build_single_line_snippet(text: &str) -> String {
@@ -1301,7 +1430,7 @@ fn extract_signature_text(node_text: &str) -> String {
     condense_whitespace(&signature_lines.join(" "))
 }
 
-fn collect_preceding_comments(source_lines: &[String], line_start: usize) -> String {
+fn collect_preceding_comments(source_lines: &[&str], line_start: usize) -> String {
     if line_start <= 1 {
         return String::new();
     }
@@ -1340,10 +1469,102 @@ pub(super) fn extract_node_text(node: Node<'_>, source_bytes: &[u8]) -> String {
 }
 
 pub(super) fn collect_named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut named_children = Vec::new();
     let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .filter(|child| child.is_named())
-        .collect::<Vec<_>>()
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            named_children.push(child);
+        }
+    }
+    named_children
+}
+
+fn visit_named_children(node: Node<'_>, mut visitor: impl FnMut(Node<'_>)) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            visitor(child);
+        }
+    }
+}
+
+fn build_container_context(
+    node: Node<'_>,
+    context: &SourceContext<'_>,
+) -> Option<ContainerContext> {
+    match context.language {
+        SupportedLanguage::Rust => {
+            if node.kind() != "impl_item" {
+                return None;
+            }
+
+            let type_node = node.child_by_field_name("type")?;
+            let container_name = extract_node_text(type_node, context.source_bytes);
+            if container_name.is_empty() {
+                return None;
+            }
+
+            let mut member_names = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if !child.is_named() || child.kind() != "function_item" {
+                    continue;
+                }
+                if let Some(name) = extract_symbol_name(child, context.source_bytes) {
+                    member_names.push(name);
+                }
+            }
+
+            if let Some(body_node) = node.child_by_field_name("body") {
+                let mut body_cursor = body_node.walk();
+                for child in body_node.children(&mut body_cursor) {
+                    if !child.is_named() || child.kind() != "function_item" {
+                        continue;
+                    }
+                    if let Some(name) = extract_symbol_name(child, context.source_bytes) {
+                        if !member_names.contains(&name) {
+                            member_names.push(name);
+                        }
+                    }
+                }
+            }
+
+            Some(ContainerContext {
+                container_name,
+                member_names,
+            })
+        }
+        SupportedLanguage::TypeScript => {
+            if node.kind() != "class_declaration" {
+                return None;
+            }
+
+            let name_node = node.child_by_field_name("name")?;
+            let container_name = extract_node_text(name_node, context.source_bytes);
+            if container_name.is_empty() {
+                return None;
+            }
+
+            let mut member_names = Vec::new();
+            if let Some(body_node) = node.child_by_field_name("body") {
+                let mut body_cursor = body_node.walk();
+                for child in body_node.children(&mut body_cursor) {
+                    if !child.is_named() || child.kind() != "method_definition" {
+                        continue;
+                    }
+                    if let Some(name) = extract_symbol_name(child, context.source_bytes) {
+                        member_names.push(name);
+                    }
+                }
+            }
+
+            Some(ContainerContext {
+                container_name,
+                member_names,
+            })
+        }
+        SupportedLanguage::Go => None,
+    }
 }
 
 fn is_identifier_like(node_kind: &str) -> bool {
@@ -1381,20 +1602,10 @@ fn dedup_trace_steps(mut trace_steps: Vec<TraceStep>) -> Vec<TraceStep> {
             .cmp(&right.line_start)
             .then_with(|| left.label.cmp(&right.label))
     });
-
-    let mut seen_keys = HashSet::new();
-    let mut deduplicated_steps = Vec::new();
-
-    for trace_step in trace_steps {
-        let step_key = format!("{}:{}", trace_step.line_start, trace_step.label);
-        if !seen_keys.insert(step_key) {
-            continue;
-        }
-
-        deduplicated_steps.push(trace_step);
-    }
-
-    deduplicated_steps
+    trace_steps.dedup_by(|right, left| {
+        right.line_start == left.line_start && right.label == left.label
+    });
+    trace_steps
 }
 
 fn dedup_trace_references(mut trace_references: Vec<TraceReference>) -> Vec<TraceReference> {
@@ -1523,141 +1734,24 @@ fn build_import_hint(
     }
 }
 
-struct ContainerBlock {
-    line_start: usize,
-    line_end: usize,
-    container_name: String,
-    member_names: Vec<String>,
-}
-
-fn populate_sibling_context(
-    root_node: Node<'_>,
-    context: &SourceContext<'_>,
-    targets: &mut Vec<SearchTarget>,
+fn populate_top_level_sibling_context(
+    targets: &mut [SearchTarget],
+    top_level_target_indices: &[usize],
 ) {
-    let container_blocks = collect_container_blocks(root_node, context);
-
-    for target in targets.iter_mut() {
-        for block in &container_blocks {
-            if target.line_start >= block.line_start && target.line_end <= block.line_end {
-                target.container_name = Some(block.container_name.clone());
-                if target.target_kind == SearchTargetKind::Method {
-                    target.parent_symbol_name = Some(block.container_name.clone());
-                }
-                target.sibling_symbol_names = block
-                    .member_names
-                    .iter()
-                    .filter(|name| *name != &target.symbol_name)
-                    .cloned()
-                    .collect();
-                break;
-            }
-        }
-    }
-
-    // Top-level targets that don't belong to any container: siblings are other top-level targets
-    let top_level_names: Vec<String> = targets
+    let top_level_names: Vec<String> = top_level_target_indices
         .iter()
-        .filter(|t| t.container_name.is_none() && t.target_kind != SearchTargetKind::LocalBinding)
-        .map(|t| t.symbol_name.clone())
+        .filter_map(|target_index| targets.get(*target_index))
+        .map(|target| target.symbol_name.clone())
         .collect();
 
-    for target in targets.iter_mut() {
-        if target.container_name.is_none()
-            && target.sibling_symbol_names.is_empty()
-            && target.target_kind != SearchTargetKind::LocalBinding
-        {
+    for target_index in top_level_target_indices {
+        if let Some(target) = targets.get_mut(*target_index) {
             target.sibling_symbol_names = top_level_names
                 .iter()
                 .filter(|name| *name != &target.symbol_name)
                 .cloned()
                 .collect();
         }
-    }
-}
-
-fn collect_container_blocks(
-    root_node: Node<'_>,
-    context: &SourceContext<'_>,
-) -> Vec<ContainerBlock> {
-    let mut blocks = Vec::new();
-    collect_container_blocks_in_node(root_node, context, &mut blocks);
-    blocks
-}
-
-fn collect_container_blocks_in_node(
-    node: Node<'_>,
-    context: &SourceContext<'_>,
-    blocks: &mut Vec<ContainerBlock>,
-) {
-    match context.language {
-        SupportedLanguage::Rust => {
-            if node.kind() == "impl_item" {
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    let container_name = extract_node_text(type_node, context.source_bytes);
-                    if !container_name.is_empty() {
-                        let mut member_names = Vec::new();
-                        for child in collect_named_children(node) {
-                            if child.kind() == "function_item" {
-                                if let Some(name) = extract_symbol_name(child, context.source_bytes) {
-                                    member_names.push(name);
-                                }
-                            }
-                        }
-                        // Also check declaration_list for impl items
-                        if let Some(body) = node.child_by_field_name("body") {
-                            for child in collect_named_children(body) {
-                                if child.kind() == "function_item" {
-                                    if let Some(name) = extract_symbol_name(child, context.source_bytes) {
-                                        if !member_names.contains(&name) {
-                                            member_names.push(name);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        blocks.push(ContainerBlock {
-                            line_start: node.start_position().row + 1,
-                            line_end: node.end_position().row + 1,
-                            container_name,
-                            member_names,
-                        });
-                    }
-                }
-            }
-        }
-        SupportedLanguage::TypeScript => {
-            if node.kind() == "class_declaration" {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let container_name = extract_node_text(name_node, context.source_bytes);
-                    if !container_name.is_empty() {
-                        let mut member_names = Vec::new();
-                        if let Some(body) = node.child_by_field_name("body") {
-                            for child in collect_named_children(body) {
-                                if child.kind() == "method_definition" {
-                                    if let Some(name) = extract_symbol_name(child, context.source_bytes) {
-                                        member_names.push(name);
-                                    }
-                                }
-                            }
-                        }
-                        blocks.push(ContainerBlock {
-                            line_start: node.start_position().row + 1,
-                            line_end: node.end_position().row + 1,
-                            container_name,
-                            member_names,
-                        });
-                    }
-                }
-            }
-        }
-        SupportedLanguage::Go => {
-            // Go uses receiver-based methods, grouping is complex; skip for now
-        }
-    }
-
-    for child in collect_named_children(node) {
-        collect_container_blocks_in_node(child, context, blocks);
     }
 }
 
@@ -1681,4 +1775,138 @@ fn dedup_call_references(mut call_references: Vec<CallReference>) -> Vec<CallRef
     }
 
     deduplicated_references
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::model::SearchTargetKind;
+
+    use super::analyze_file;
+
+    #[test]
+    fn analyze_file_populates_container_context_without_post_pass() {
+        let temp_dir = create_temp_directory();
+        let file_path = temp_dir.join("search_service.ts");
+        fs::write(
+            &file_path,
+            r#"
+class SearchService {
+  search(query: string) {
+    const result = query.trim();
+    return result;
+  }
+
+  helper() {
+    return 1;
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let file_analysis = analyze_file(&temp_dir, &file_path).unwrap();
+        let class_target = file_analysis
+            .targets
+            .iter()
+            .find(|search_target| {
+                search_target.target_kind == SearchTargetKind::Type
+                    && search_target.symbol_name == "SearchService"
+            })
+            .unwrap();
+        let method_target = file_analysis
+            .targets
+            .iter()
+            .find(|search_target| {
+                search_target.target_kind == SearchTargetKind::Method
+                    && search_target.symbol_name == "search"
+            })
+            .unwrap();
+        let binding_target = file_analysis
+            .targets
+            .iter()
+            .find(|search_target| {
+                search_target.target_kind == SearchTargetKind::LocalBinding
+                    && search_target.symbol_name == "result"
+            })
+            .unwrap();
+
+        assert_eq!(class_target.container_name.as_deref(), Some("SearchService"));
+        assert_eq!(
+            class_target.sibling_symbol_names,
+            vec!["search".to_string(), "helper".to_string()]
+        );
+        assert_eq!(method_target.container_name.as_deref(), Some("SearchService"));
+        assert_eq!(method_target.parent_symbol_name.as_deref(), Some("SearchService"));
+        assert_eq!(method_target.sibling_symbol_names, vec!["helper".to_string()]);
+        assert_eq!(binding_target.container_name.as_deref(), Some("SearchService"));
+        assert_eq!(binding_target.parent_symbol_name.as_deref(), Some("search"));
+        assert_eq!(
+            binding_target.sibling_symbol_names,
+            vec!["search".to_string(), "helper".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn analyze_file_populates_top_level_siblings_after_traversal() {
+        let temp_dir = create_temp_directory();
+        let file_path = temp_dir.join("top_level.rs");
+        fs::write(
+            &file_path,
+            r#"
+fn search() -> String {
+    helper()
+}
+
+fn helper() -> String {
+    String::new()
+}
+"#,
+        )
+        .unwrap();
+
+        let file_analysis = analyze_file(&temp_dir, &file_path).unwrap();
+        let search_target = file_analysis
+            .targets
+            .iter()
+            .find(|search_target| {
+                search_target.target_kind == SearchTargetKind::Function
+                    && search_target.symbol_name == "search"
+            })
+            .unwrap();
+        let helper_target = file_analysis
+            .targets
+            .iter()
+            .find(|search_target| {
+                search_target.target_kind == SearchTargetKind::Function
+                    && search_target.symbol_name == "helper"
+            })
+            .unwrap();
+
+        assert_eq!(search_target.container_name, None);
+        assert_eq!(search_target.sibling_symbol_names, vec!["helper".to_string()]);
+        assert_eq!(helper_target.container_name, None);
+        assert_eq!(helper_target.sibling_symbol_names, vec!["search".to_string()]);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn create_temp_directory() -> PathBuf {
+        let directory_name = format!(
+            "code-search-parser-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory_path = std::env::temp_dir().join(directory_name);
+        fs::create_dir_all(&directory_path).unwrap();
+        directory_path
+    }
 }

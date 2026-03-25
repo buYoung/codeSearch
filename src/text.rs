@@ -1,39 +1,41 @@
 pub(crate) fn tokenize_text(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    let characters: Vec<char> = text.chars().collect();
     let mut current_token = String::new();
+    let mut previous_character = None;
+    let mut characters = text.chars().peekable();
 
-    for (index, character) in characters.iter().enumerate() {
+    while let Some(character) = characters.next() {
         let is_alphanumeric = character.is_alphanumeric();
         if !is_alphanumeric {
             flush_token(&mut current_token, &mut tokens);
+            previous_character = Some(character);
             continue;
         }
 
-        let previous_character = if index > 0 {
-            Some(characters[index - 1])
-        } else {
-            None
-        };
-        let next_character = characters.get(index + 1).copied();
+        let next_character = characters.peek().copied();
 
         let should_split_before_uppercase = character.is_uppercase()
             && !current_token.is_empty()
             && matches!(
                 previous_character,
-                Some(previous) if previous.is_lowercase() || previous.is_numeric()
+                Some(previous_character)
+                    if previous_character.is_lowercase() || previous_character.is_numeric()
             );
 
         let should_split_before_acronym_tail = character.is_uppercase()
             && !current_token.is_empty()
-            && matches!(previous_character, Some(previous) if previous.is_uppercase())
-            && matches!(next_character, Some(next) if next.is_lowercase());
+            && matches!(
+                previous_character,
+                Some(previous_character) if previous_character.is_uppercase()
+            )
+            && matches!(next_character, Some(next_character) if next_character.is_lowercase());
 
         if should_split_before_uppercase || should_split_before_acronym_tail {
             flush_token(&mut current_token, &mut tokens);
         }
 
         current_token.extend(character.to_lowercase());
+        previous_character = Some(character);
     }
 
     flush_token(&mut current_token, &mut tokens);
@@ -60,6 +62,5 @@ fn flush_token(current_token: &mut String, tokens: &mut Vec<String>) {
         return;
     }
 
-    tokens.push(current_token.clone());
-    current_token.clear();
+    tokens.push(std::mem::take(current_token));
 }

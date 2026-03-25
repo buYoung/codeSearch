@@ -192,18 +192,6 @@ Mode: direct
 | `results[].sections[].entries[].location` | `file_path`, `line_start`, `line_end` 구조화 위치 |
 | `results[].raw_target` | signature, dependency, flow, parent symbol 등 메타데이터 |
 
-## Documentation
-
-- [설계 배경 (PoC)](docs/code-search-poc.md)
-- [구현 메모](docs/search-implementation.md)
-- [Agent-first 리팩터링 계획](docs/agent-first-refactor-execution-plan.md)
-
-## Roadmap
-
-- [ ] Persistent index 지원
-- [ ] Semantic search 통합
-- [ ] `read-file` / `read-range` 명령 추가
-
 ## License
 
 이 프로젝트는 [MIT License](LICENSE) 하에 배포됩니다.

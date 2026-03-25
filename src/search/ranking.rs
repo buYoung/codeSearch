@@ -1,11 +1,12 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, Schema, FAST, STORED, TEXT};
-use tantivy::{doc, Index};
+use tantivy::{DocAddress, Index, Score, doc};
 
 use crate::model::{SearchError, SearchMode, SearchTarget, SearchTargetKind};
 use crate::text::tokenize_text;
@@ -14,12 +15,12 @@ use crate::text::tokenize_text;
 pub(crate) struct ScoredSearchTarget {
     pub(crate) target_index: usize,
     pub(crate) score: f64,
-    pub(crate) is_exact_symbol_match: bool,
     pub(crate) is_direct_match: bool,
 }
 
 pub(crate) struct RankingArtifacts {
     pub(crate) scored_targets: Vec<ScoredSearchTarget>,
+    pub(crate) matched_target_count: usize,
     pub(crate) callable_indices_by_name: HashMap<String, Vec<usize>>,
     pub(crate) caller_index: HashMap<usize, Vec<usize>>,
 }
@@ -28,46 +29,26 @@ pub(crate) fn rank_search_targets(
     query: &str,
     search_mode: SearchMode,
     search_targets: &[SearchTarget],
+    result_limit: usize,
 ) -> Result<RankingArtifacts, SearchError> {
     let normalized_query = normalize_query(query);
     let callable_indices_by_name = build_callable_indices_by_name(search_targets);
     let caller_index = build_caller_index(search_targets, &callable_indices_by_name);
+    let query_context = SearchQueryContext::build(&normalized_query, search_targets);
     let search_index = TantivySearchIndex::build(search_targets)?;
-    let mut scored_targets = search_index
-        .score_chunks(&normalized_query, search_targets.len())?
+    let search_query_scores =
+        search_index.score_chunks(&normalized_query, search_mode, result_limit, &query_context)?;
+    let mut scored_targets = search_query_scores
+        .ranked_chunks
         .into_iter()
-        .map(|(target_index, base_score)| {
-            let search_target = &search_targets[target_index];
-            let is_exact_symbol_match = is_exact_symbol_match(&normalized_query, search_target);
-
-            ScoredSearchTarget {
-                target_index,
-                score: adjust_score(base_score, &normalized_query, search_target),
-                is_exact_symbol_match,
-                is_direct_match: false,
-            }
+        .map(|(target_index, score)| ScoredSearchTarget {
+            target_index,
+            score,
+            is_direct_match: query_context.is_direct_match(target_index),
         })
         .collect::<Vec<_>>();
 
-    let exact_primary_match_exists = scored_targets.iter().any(|scored_target| {
-        scored_target.is_exact_symbol_match
-            && is_primary_direct_kind(search_targets[scored_target.target_index].target_kind)
-    });
-
     if search_mode == SearchMode::Direct {
-        for scored_target in &mut scored_targets {
-            let target_kind = search_targets[scored_target.target_index].target_kind;
-            scored_target.is_direct_match = match target_kind {
-                SearchTargetKind::Function | SearchTargetKind::Method | SearchTargetKind::Type => {
-                    scored_target.is_exact_symbol_match
-                }
-                SearchTargetKind::LocalBinding => {
-                    !exact_primary_match_exists && scored_target.is_exact_symbol_match
-                }
-                SearchTargetKind::File => false,
-            };
-        }
-
         scored_targets.sort_by(|left, right| compare_direct_mode(left, right, search_targets));
     } else {
         scored_targets.sort_by(|left, right| compare_explore_mode(left, right, search_targets));
@@ -75,9 +56,151 @@ pub(crate) fn rank_search_targets(
 
     Ok(RankingArtifacts {
         scored_targets,
+        matched_target_count: search_query_scores.matched_target_count,
         callable_indices_by_name,
         caller_index,
     })
+}
+
+struct SearchQueryScores {
+    ranked_chunks: Vec<(usize, f64)>,
+    matched_target_count: usize,
+}
+
+struct SearchQueryContext {
+    direct_matches: Arc<[bool]>,
+    score_adjustments: Arc<[f32]>,
+    target_kinds: Arc<[SearchTargetKind]>,
+    path_ranks: Arc<[u64]>,
+    line_starts: Arc<[u64]>,
+}
+
+impl SearchQueryContext {
+    fn build(normalized_query: &str, search_targets: &[SearchTarget]) -> Self {
+        let len = search_targets.len();
+        let mut exact_symbol_matches = Vec::with_capacity(len);
+        let mut score_adjustments = Vec::with_capacity(len);
+        let mut target_kinds = Vec::with_capacity(len);
+        let mut line_starts = Vec::with_capacity(len);
+        let mut exact_primary_match_exists = false;
+        let mut unique_paths = BTreeMap::<&Path, ()>::new();
+
+        for search_target in search_targets {
+            let is_exact = is_exact_symbol_match(normalized_query, search_target);
+            exact_symbol_matches.push(is_exact);
+            if is_exact && is_primary_direct_kind(search_target.target_kind) {
+                exact_primary_match_exists = true;
+            }
+            score_adjustments.push(score_adjustment(normalized_query, search_target, is_exact));
+            target_kinds.push(search_target.target_kind);
+            line_starts.push(search_target.line_start as u64);
+            unique_paths.entry(search_target.file_path.as_path()).or_insert(());
+        }
+
+        let path_rank_map: BTreeMap<&Path, u64> = unique_paths
+            .keys()
+            .enumerate()
+            .map(|(rank, path)| (*path, rank as u64))
+            .collect();
+
+        let mut direct_matches = Vec::with_capacity(len);
+        let mut path_ranks = Vec::with_capacity(len);
+
+        for (target_index, search_target) in search_targets.iter().enumerate() {
+            let is_direct = match search_target.target_kind {
+                SearchTargetKind::Function | SearchTargetKind::Method | SearchTargetKind::Type => {
+                    exact_symbol_matches[target_index]
+                }
+                SearchTargetKind::LocalBinding => {
+                    !exact_primary_match_exists && exact_symbol_matches[target_index]
+                }
+                SearchTargetKind::File => false,
+            };
+            direct_matches.push(is_direct);
+            path_ranks.push(
+                *path_rank_map
+                    .get(search_target.file_path.as_path())
+                    .expect("path rank should exist for every search target"),
+            );
+        }
+
+        Self {
+            direct_matches: Arc::from(direct_matches),
+            score_adjustments: Arc::from(score_adjustments),
+            target_kinds: Arc::from(target_kinds),
+            path_ranks: Arc::from(path_ranks),
+            line_starts: Arc::from(line_starts),
+        }
+    }
+    fn is_direct_match(&self, target_index: usize) -> bool {
+        self.direct_matches[target_index]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirectRankKey {
+    is_direct_match: bool,
+    kind_priority: usize,
+    adjusted_score: Score,
+    path_rank: u64,
+    line_start: u64,
+}
+
+impl Ord for DirectRankKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.is_direct_match
+            .cmp(&other.is_direct_match)
+            .then_with(|| other.kind_priority.cmp(&self.kind_priority))
+            .then_with(|| self.adjusted_score.total_cmp(&other.adjusted_score))
+            .then_with(|| other.path_rank.cmp(&self.path_rank))
+            .then_with(|| other.line_start.cmp(&self.line_start))
+    }
+}
+
+impl PartialEq for DirectRankKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for DirectRankKey {}
+
+impl PartialOrd for DirectRankKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExploreRankKey {
+    adjusted_score: Score,
+    kind_priority: usize,
+    path_rank: u64,
+    line_start: u64,
+}
+
+impl Ord for ExploreRankKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.adjusted_score
+            .total_cmp(&other.adjusted_score)
+            .then_with(|| other.kind_priority.cmp(&self.kind_priority))
+            .then_with(|| other.path_rank.cmp(&self.path_rank))
+            .then_with(|| other.line_start.cmp(&self.line_start))
+    }
+}
+
+impl PartialEq for ExploreRankKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ExploreRankKey {}
+
+impl PartialOrd for ExploreRankKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub(crate) fn resolve_callable_index(
@@ -167,15 +290,15 @@ fn build_caller_index(
     caller_index
 }
 
-fn adjust_score(
-    base_score: f64,
+fn score_adjustment(
     normalized_query: &str,
     search_target: &SearchTarget,
-) -> f64 {
-    let mut adjusted_score = base_score;
+    is_exact_symbol_match: bool,
+) -> f32 {
+    let mut adjustment = 0.0f32;
 
-    if normalized_query == search_target.symbol_name_search_text {
-        adjusted_score += match search_target.target_kind {
+    if is_exact_symbol_match {
+        adjustment += match search_target.target_kind {
             SearchTargetKind::Function | SearchTargetKind::Method => 0.6,
             SearchTargetKind::Type => 0.5,
             SearchTargetKind::LocalBinding => 0.4,
@@ -184,15 +307,14 @@ fn adjust_score(
     }
 
     if search_target
-        .parent_symbol_name
+        .parent_symbol_name_search_text
         .as_ref()
-        .map(|parent_symbol_name| normalize_query(parent_symbol_name))
-        .is_some_and(|parent_symbol_name| parent_symbol_name == normalized_query)
+        .is_some_and(|text| text == normalized_query)
     {
-        adjusted_score += 0.1;
+        adjustment += 0.1;
     }
 
-    adjusted_score
+    adjustment
 }
 
 fn normalize_query(query: &str) -> String {
@@ -328,10 +450,15 @@ impl TantivySearchIndex {
     fn score_chunks(
         &self,
         normalized_query: &str,
+        search_mode: SearchMode,
         result_limit: usize,
-    ) -> Result<Vec<(usize, f64)>, SearchError> {
+        query_context: &SearchQueryContext,
+    ) -> Result<SearchQueryScores, SearchError> {
         if normalized_query.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchQueryScores {
+                ranked_chunks: Vec::new(),
+                matched_target_count: 0,
+            });
         }
 
         let reader = self.index.reader()?;
@@ -344,8 +471,6 @@ impl TantivySearchIndex {
         query_parser.set_field_boost(self.signature_field, 3.0);
         query_parser.set_field_boost(self.context_field, 1.0);
         let parsed_query = query_parser.parse_query(normalized_query)?;
-        let top_documents =
-            searcher.search(&parsed_query, &TopDocs::with_limit(result_limit.max(1)))?;
         let chunk_index_readers = searcher
             .segment_readers()
             .iter()
@@ -356,16 +481,149 @@ impl TantivySearchIndex {
                     .map(|column| column.first_or_default_col(0))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut scored_chunks = Vec::with_capacity(top_documents.len());
+        let search_query_scores = match search_mode {
+            SearchMode::Direct => {
+                self.collect_direct_scores(&searcher, &parsed_query, result_limit, query_context)?
+            }
+            SearchMode::Explore => {
+                self.collect_explore_scores(&searcher, &parsed_query, result_limit, query_context)?
+            }
+        };
+        let ranked_chunks = search_query_scores
+            .ranked_documents
+            .into_iter()
+            .map(|(score, document_address)| {
+                let chunk_index = chunk_index_readers[document_address.segment_ord as usize]
+                    .get_val(document_address.doc_id);
+                (chunk_index as usize, score)
+            })
+            .collect::<Vec<_>>();
 
-        for (score, document_address) in top_documents {
-            let chunk_index = chunk_index_readers[document_address.segment_ord as usize]
-                .get_val(document_address.doc_id);
-            scored_chunks.push((chunk_index as usize, score as f64));
-        }
-
-        Ok(scored_chunks)
+        Ok(SearchQueryScores {
+            ranked_chunks,
+            matched_target_count: search_query_scores.matched_target_count,
+        })
     }
+
+    fn collect_direct_scores(
+        &self,
+        searcher: &tantivy::Searcher,
+        parsed_query: &dyn tantivy::query::Query,
+        result_limit: usize,
+        query_context: &SearchQueryContext,
+    ) -> Result<CollectedSearchScores, SearchError> {
+        let direct_matches = Arc::clone(&query_context.direct_matches);
+        let score_adjustments = Arc::clone(&query_context.score_adjustments);
+        let target_kinds = Arc::clone(&query_context.target_kinds);
+        let path_ranks = Arc::clone(&query_context.path_ranks);
+        let line_starts = Arc::clone(&query_context.line_starts);
+        let mut collectors = MultiCollector::new();
+        let top_documents_handle = collectors.add_collector(
+            TopDocs::with_limit(result_limit.max(1)).tweak_score(
+                move |segment_reader: &tantivy::SegmentReader| {
+                    let chunk_index_reader = segment_reader
+                        .fast_fields()
+                        .u64("chunk_index")
+                        .expect("chunk_index fast field should exist")
+                        .first_or_default_col(0);
+                    let direct_matches = Arc::clone(&direct_matches);
+                    let score_adjustments = Arc::clone(&score_adjustments);
+                    let target_kinds = Arc::clone(&target_kinds);
+                    let path_ranks = Arc::clone(&path_ranks);
+                    let line_starts = Arc::clone(&line_starts);
+
+                    move |doc, original_score| {
+                        let chunk_index = chunk_index_reader.get_val(doc) as usize;
+                        let is_direct_match = direct_matches[chunk_index];
+                        let kind_priority = if is_direct_match {
+                            direct_kind_priority(target_kinds[chunk_index])
+                        } else {
+                            related_kind_priority(target_kinds[chunk_index])
+                        };
+
+                        DirectRankKey {
+                            is_direct_match,
+                            kind_priority,
+                            adjusted_score: original_score + score_adjustments[chunk_index],
+                            path_rank: path_ranks[chunk_index],
+                            line_start: line_starts[chunk_index],
+                        }
+                    }
+                },
+            ),
+        );
+        let count_handle = collectors.add_collector(Count);
+        let mut multi_fruits = searcher.search(parsed_query, &collectors)?;
+        let matched_target_count = count_handle.extract(&mut multi_fruits);
+        let ranked_chunks = top_documents_handle
+            .extract(&mut multi_fruits)
+            .into_iter()
+            .map(|(rank_key, document_address)| (rank_key.adjusted_score as f64, document_address))
+            .collect::<Vec<_>>();
+
+        Ok(CollectedSearchScores {
+            ranked_documents: ranked_chunks,
+            matched_target_count,
+        })
+    }
+
+    fn collect_explore_scores(
+        &self,
+        searcher: &tantivy::Searcher,
+        parsed_query: &dyn tantivy::query::Query,
+        result_limit: usize,
+        query_context: &SearchQueryContext,
+    ) -> Result<CollectedSearchScores, SearchError> {
+        let score_adjustments = Arc::clone(&query_context.score_adjustments);
+        let target_kinds = Arc::clone(&query_context.target_kinds);
+        let path_ranks = Arc::clone(&query_context.path_ranks);
+        let line_starts = Arc::clone(&query_context.line_starts);
+        let mut collectors = MultiCollector::new();
+        let top_documents_handle = collectors.add_collector(
+            TopDocs::with_limit(result_limit.max(1)).tweak_score(
+                move |segment_reader: &tantivy::SegmentReader| {
+                    let chunk_index_reader = segment_reader
+                        .fast_fields()
+                        .u64("chunk_index")
+                        .expect("chunk_index fast field should exist")
+                        .first_or_default_col(0);
+                    let score_adjustments = Arc::clone(&score_adjustments);
+                    let target_kinds = Arc::clone(&target_kinds);
+                    let path_ranks = Arc::clone(&path_ranks);
+                    let line_starts = Arc::clone(&line_starts);
+
+                    move |doc, original_score| {
+                        let chunk_index = chunk_index_reader.get_val(doc) as usize;
+
+                        ExploreRankKey {
+                            adjusted_score: original_score + score_adjustments[chunk_index],
+                            kind_priority: related_kind_priority(target_kinds[chunk_index]),
+                            path_rank: path_ranks[chunk_index],
+                            line_start: line_starts[chunk_index],
+                        }
+                    }
+                },
+            ),
+        );
+        let count_handle = collectors.add_collector(Count);
+        let mut multi_fruits = searcher.search(parsed_query, &collectors)?;
+        let matched_target_count = count_handle.extract(&mut multi_fruits);
+        let ranked_chunks = top_documents_handle
+            .extract(&mut multi_fruits)
+            .into_iter()
+            .map(|(rank_key, document_address)| (rank_key.adjusted_score as f64, document_address))
+            .collect::<Vec<_>>();
+
+        Ok(CollectedSearchScores {
+            ranked_documents: ranked_chunks,
+            matched_target_count,
+        })
+    }
+}
+
+struct CollectedSearchScores {
+    ranked_documents: Vec<(f64, DocAddress)>,
+    matched_target_count: usize,
 }
 
 #[cfg(test)]
@@ -387,11 +645,60 @@ mod tests {
         ];
 
         let ranking_artifacts =
-            rank_search_targets("log", SearchMode::Direct, &search_targets).unwrap();
+            rank_search_targets("log", SearchMode::Direct, &search_targets, search_targets.len())
+                .unwrap();
 
         assert_eq!(ranking_artifacts.scored_targets[0].target_index, 1);
         assert!(ranking_artifacts.scored_targets[0].is_direct_match);
         assert!(!ranking_artifacts.scored_targets[1].is_direct_match);
+    }
+
+    #[test]
+    fn rank_search_targets_preserves_matched_target_count_with_small_limit() {
+        let search_targets = vec![
+            build_search_target(SearchTargetKind::Function, "log", 10),
+            build_search_target(SearchTargetKind::Method, "log", 20),
+            build_search_target(SearchTargetKind::LocalBinding, "log", 30),
+            build_search_target(SearchTargetKind::Function, "logger", 40),
+        ];
+
+        let ranking_artifacts =
+            rank_search_targets("log", SearchMode::Direct, &search_targets, 1).unwrap();
+
+        assert_eq!(ranking_artifacts.matched_target_count, 3);
+        assert_eq!(ranking_artifacts.scored_targets.len(), 1);
+        assert!(ranking_artifacts.scored_targets[0].is_direct_match);
+    }
+
+    #[test]
+    fn rank_search_targets_limit_matches_full_ranking_in_explore_mode() {
+        let search_targets = vec![
+            build_search_target_with_path(SearchTargetKind::Function, "search", "src/a.rs", 10),
+            build_search_target_with_path(SearchTargetKind::Type, "search", "src/c.rs", 30),
+            build_search_target_with_path(SearchTargetKind::Method, "search", "src/b.rs", 20),
+            build_search_target_with_path(SearchTargetKind::LocalBinding, "search", "src/d.rs", 40),
+        ];
+
+        let full_ranking =
+            rank_search_targets("search", SearchMode::Explore, &search_targets, search_targets.len())
+                .unwrap();
+        let limited_ranking =
+            rank_search_targets("search", SearchMode::Explore, &search_targets, 2).unwrap();
+
+        assert_eq!(limited_ranking.matched_target_count, full_ranking.matched_target_count);
+        assert_eq!(
+            limited_ranking
+                .scored_targets
+                .iter()
+                .map(|scored_target| scored_target.target_index)
+                .collect::<Vec<_>>(),
+            full_ranking
+                .scored_targets
+                .iter()
+                .take(2)
+                .map(|scored_target| scored_target.target_index)
+                .collect::<Vec<_>>()
+        );
     }
 
     fn build_search_target(
@@ -399,13 +706,23 @@ mod tests {
         symbol_name: &str,
         line_start: usize,
     ) -> SearchTarget {
+        build_search_target_with_path(target_kind, symbol_name, "src/example.rs", line_start)
+    }
+
+    fn build_search_target_with_path(
+        target_kind: SearchTargetKind,
+        symbol_name: &str,
+        file_path: &str,
+        line_start: usize,
+    ) -> SearchTarget {
         SearchTarget {
-            target_id: format!("src/example.rs#L{line_start}-L{line_start}:{target_kind}:{symbol_name}"),
-            file_path: PathBuf::from("src/example.rs"),
+            target_id: format!("{file_path}#L{line_start}-L{line_start}:{target_kind}:{symbol_name}"),
+            file_path: PathBuf::from(file_path),
             language: SupportedLanguage::Rust,
             target_kind,
             symbol_name: symbol_name.to_string(),
             parent_symbol_name: None,
+            parent_symbol_name_search_text: None,
             line_start,
             line_end: line_start,
             symbol_name_search_text: normalize_query(symbol_name),

@@ -33,6 +33,7 @@ pub struct SearchTarget {
     pub target_kind: SearchTargetKind,
     pub symbol_name: String,
     pub parent_symbol_name: Option<String>,
+    pub parent_symbol_name_search_text: Option<String>,
     pub line_start: usize,
     pub line_end: usize,
     pub symbol_name_search_text: String,

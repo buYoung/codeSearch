@@ -64,15 +64,16 @@ impl CodeSearchService {
 
         let ranking::RankingArtifacts {
             scored_targets,
+            matched_target_count,
             callable_indices_by_name,
             caller_index,
-        } = ranking::rank_search_targets(&request.query, search_mode, &search_targets)?;
-        let matched_target_count = scored_targets.len();
-        let limited_scored_targets = scored_targets
-            .into_iter()
-            .take(request.limit)
-            .collect::<Vec<_>>();
-        let results = limited_scored_targets
+        } = ranking::rank_search_targets(
+            &request.query,
+            search_mode,
+            &search_targets,
+            request.limit,
+        )?;
+        let results = scored_targets
             .into_iter()
             .map(|scored_target| {
                 trace::build_search_hit(

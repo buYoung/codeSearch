@@ -447,6 +447,7 @@ mod tests {
             target_kind: SearchTargetKind::Function,
             symbol_name: "log".to_string(),
             parent_symbol_name: None,
+            parent_symbol_name_search_text: None,
             line_start: 10,
             line_end: 10,
             symbol_name_search_text: "log".to_string(),
